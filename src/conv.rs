@@ -171,12 +171,7 @@ impl StreamingConv1d {
         // On first call with replicate padding, fill previous with first sample
         if tp > 0 && matches!(self.pad_mode, PadMode::Replicate) && state.first {
             let init = x.narrow(2, 0, 1)?.contiguous()?;
-            state.previous = if tp == 1 {
-                init
-            } else {
-                let refs: Vec<&Tensor> = (0..tp).map(|_| &init).collect();
-                Tensor::cat(&refs, 2)?
-            };
+            state.previous = init.repeat(&[1, 1, tp])?;
         }
 
         // Prepend previous state

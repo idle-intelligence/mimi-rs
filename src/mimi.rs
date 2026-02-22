@@ -101,7 +101,6 @@ impl MimiModel {
         let hop_length: usize = cfg.ratios.iter().product();
         let encoder_frame_rate = cfg.sample_rate as f64 / hop_length as f64;
 
-        let _device = vb.device().clone();
         let (downsample, upsample) =
             if (encoder_frame_rate - cfg.frame_rate as f64).abs() > 0.01 {
                 let downsample_stride = (encoder_frame_rate / cfg.frame_rate as f64) as usize;

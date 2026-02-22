@@ -132,7 +132,12 @@ impl StreamingTransformerState {
 
 // ---- Causal mask helper ----
 
-fn causal_mask(num_queries: usize, num_keys: usize, device: &Device) -> Result<Tensor> {
+/// Returns `None` when the mask is all-zeros (T=1 streaming), skipping an
+/// allocation and broadcast_add that would be a no-op.
+fn causal_mask(num_queries: usize, num_keys: usize, device: &Device) -> Result<Option<Tensor>> {
+    if num_queries == 1 {
+        return Ok(None);
+    }
     let shift = num_keys - num_queries;
     let mut data = Vec::with_capacity(num_queries * num_keys);
     for q in 0..num_queries {
@@ -144,7 +149,7 @@ fn causal_mask(num_queries: usize, num_keys: usize, device: &Device) -> Result<T
             }
         }
     }
-    Tensor::from_vec(data, (num_queries, num_keys), device)
+    Ok(Some(Tensor::from_vec(data, (num_queries, num_keys), device)?))
 }
 
 // ---- MimiStreamingMultiheadAttention ----
@@ -203,12 +208,14 @@ impl MimiStreamingMHA {
         let attn = q.matmul(&k.transpose(2, 3)?)?;
         let attn = (attn * scale)?;
 
-        // Causal mask
+        // Causal mask (skipped for T=1 streaming — mask is all zeros)
         let kv_len = k.dim(2)?;
-        let mask = causal_mask(t, kv_len, query.device())?;
-        // Broadcast mask over [B, H, T, kv_len]
-        let mask = mask.reshape((1, 1, t, kv_len))?;
-        let attn = attn.broadcast_add(&mask)?;
+        let attn = if let Some(mask) = causal_mask(t, kv_len, query.device())? {
+            let mask = mask.reshape((1, 1, t, kv_len))?;
+            attn.broadcast_add(&mask)?
+        } else {
+            attn
+        };
 
         let attn = candle_nn::ops::softmax_last_dim(&attn)?;
         let x = attn.matmul(&v)?;
@@ -262,9 +269,15 @@ impl StreamingMultiheadAttention {
         // Apply RoPE: q, k are [B, T, H, D]
         let (q, k) = rope.forward(&q, &k, offset)?;
 
-        // Accumulate KV chunks
-        state.k_chunks.push(k);
-        state.v_chunks.push(v);
+        // Accumulate KV chunks, consolidating to avoid O(n^2) cat in get_kv()
+        if let Some(prev_k) = state.k_chunks.pop() {
+            let prev_v = state.v_chunks.pop().unwrap();
+            state.k_chunks.push(Tensor::cat(&[&prev_k, &k], 1)?);
+            state.v_chunks.push(Tensor::cat(&[&prev_v, &v], 1)?);
+        } else {
+            state.k_chunks.push(k);
+            state.v_chunks.push(v);
+        }
         state.current_end += t;
 
         let (k_full, v_full) = state.get_kv()?.unwrap();
@@ -275,15 +288,19 @@ impl StreamingMultiheadAttention {
         let k_full = k_full.transpose(1, 2)?;
         let v_full = v_full.transpose(1, 2)?;
 
-        // Causal mask
+        // Causal mask (skipped for T=1 streaming — mask is all zeros)
         let mask = causal_mask(t, kv_len, query.device())?;
-        let mask = mask.reshape((1, 1, t, kv_len))?;
 
         // Scaled dot-product attention
         let scale = (d as f64).sqrt().recip();
         let attn = q.matmul(&k_full.transpose(2, 3)?)?;
         let attn = (attn * scale)?;
-        let attn = attn.broadcast_add(&mask)?;
+        let attn = if let Some(mask) = mask {
+            let mask = mask.reshape((1, 1, t, kv_len))?;
+            attn.broadcast_add(&mask)?
+        } else {
+            attn
+        };
         let attn = candle_nn::ops::softmax_last_dim(&attn)?;
         let x = attn.matmul(&v_full)?;
 
