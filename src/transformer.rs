@@ -1,7 +1,9 @@
 use crate::layer_scale::LayerScale;
+use crate::qlinear::QLinear;
 use crate::rope::RotaryEmbedding;
+use candle_core::quantized::GgmlDType;
 use candle_core::{Device, Result, Tensor};
-use candle_nn::{LayerNorm, LayerNormConfig, Linear, Module, VarBuilder};
+use candle_nn::{LayerNorm, LayerNormConfig, Module, VarBuilder};
 
 // ---- KV Cache ----
 
@@ -156,8 +158,8 @@ fn causal_mask(num_queries: usize, num_keys: usize, device: &Device) -> Result<O
 // Uses KV cache with context window.
 
 struct MimiStreamingMHA {
-    in_proj: Linear,
-    out_proj: Linear,
+    in_proj: QLinear,
+    out_proj: QLinear,
     embed_dim: usize,
     num_heads: usize,
     context: usize,
@@ -166,9 +168,15 @@ struct MimiStreamingMHA {
 impl MimiStreamingMHA {
     fn load(vb: VarBuilder, embed_dim: usize, num_heads: usize, context: usize) -> Result<Self> {
         let out_dim = 3 * embed_dim;
-        let in_proj = candle_nn::linear_no_bias(embed_dim, out_dim, vb.pp("in_proj"))?;
-        let out_proj = candle_nn::linear_no_bias(embed_dim, embed_dim, vb.pp("out_proj"))?;
+        let in_proj = QLinear::from_linear(candle_nn::linear_no_bias(embed_dim, out_dim, vb.pp("in_proj"))?);
+        let out_proj = QLinear::from_linear(candle_nn::linear_no_bias(embed_dim, embed_dim, vb.pp("out_proj"))?);
         Ok(Self { in_proj, out_proj, embed_dim, num_heads, context })
+    }
+
+    fn quantize_weights(&mut self, dtype: GgmlDType) -> Result<()> {
+        self.in_proj.quantize_in_place(dtype)?;
+        self.out_proj.quantize_in_place(dtype)?;
+        Ok(())
     }
 
     fn init_state(&self) -> KvCache {
@@ -228,8 +236,8 @@ impl MimiStreamingMHA {
 // ---- StreamingMultiheadAttention (FlowLM) ----
 
 pub struct StreamingMultiheadAttention {
-    in_proj: Linear,
-    out_proj: Linear,
+    in_proj: QLinear,
+    out_proj: QLinear,
     pub embed_dim: usize,
     pub num_heads: usize,
 }
@@ -237,9 +245,15 @@ pub struct StreamingMultiheadAttention {
 impl StreamingMultiheadAttention {
     pub fn load(vb: VarBuilder, embed_dim: usize, num_heads: usize) -> Result<Self> {
         let out_dim = 3 * embed_dim;
-        let in_proj = candle_nn::linear_no_bias(embed_dim, out_dim, vb.pp("in_proj"))?;
-        let out_proj = candle_nn::linear_no_bias(embed_dim, embed_dim, vb.pp("out_proj"))?;
+        let in_proj = QLinear::from_linear(candle_nn::linear_no_bias(embed_dim, out_dim, vb.pp("in_proj"))?);
+        let out_proj = QLinear::from_linear(candle_nn::linear_no_bias(embed_dim, embed_dim, vb.pp("out_proj"))?);
         Ok(Self { in_proj, out_proj, embed_dim, num_heads })
+    }
+
+    pub fn quantize_weights(&mut self, dtype: GgmlDType) -> Result<()> {
+        self.in_proj.quantize_in_place(dtype)?;
+        self.out_proj.quantize_in_place(dtype)?;
+        Ok(())
     }
 
     pub fn init_state(&self) -> StreamingMHAState {
@@ -327,8 +341,8 @@ pub struct StreamingTransformerLayer {
     self_attn: AttentionKind,
     norm1: LayerNorm,
     norm2: LayerNorm,
-    linear1: Linear,
-    linear2: Linear,
+    linear1: QLinear,
+    linear2: QLinear,
     layer_scale_1: Option<LayerScale>,
     layer_scale_2: Option<LayerScale>,
 }
@@ -360,8 +374,8 @@ impl StreamingTransformerLayer {
         let ln_cfg = LayerNormConfig { eps: 1e-5, ..Default::default() };
         let norm1 = candle_nn::layer_norm(d_model, ln_cfg, vb.pp("norm1"))?;
         let norm2 = candle_nn::layer_norm(d_model, ln_cfg, vb.pp("norm2"))?;
-        let linear1 = candle_nn::linear_no_bias(d_model, dim_feedforward, vb.pp("linear1"))?;
-        let linear2 = candle_nn::linear_no_bias(dim_feedforward, d_model, vb.pp("linear2"))?;
+        let linear1 = QLinear::from_linear(candle_nn::linear_no_bias(d_model, dim_feedforward, vb.pp("linear1"))?);
+        let linear2 = QLinear::from_linear(candle_nn::linear_no_bias(dim_feedforward, d_model, vb.pp("linear2"))?);
 
         let layer_scale_1 = if layer_scale.is_some() {
             Some(LayerScale::load(vb.pp("layer_scale_1"), d_model)?)
@@ -375,6 +389,16 @@ impl StreamingTransformerLayer {
         };
 
         Ok(Self { self_attn, norm1, norm2, linear1, linear2, layer_scale_1, layer_scale_2 })
+    }
+
+    pub fn quantize_weights(&mut self, dtype: GgmlDType) -> Result<()> {
+        match &mut self.self_attn {
+            AttentionKind::Mimi(attn) => attn.quantize_weights(dtype)?,
+            AttentionKind::FlowLm(attn) => attn.quantize_weights(dtype)?,
+        }
+        self.linear1.quantize_in_place(dtype)?;
+        self.linear2.quantize_in_place(dtype)?;
+        Ok(())
     }
 
     pub fn init_state(&self) -> LayerAttentionState {
@@ -459,6 +483,13 @@ impl StreamingTransformer {
         Ok(Self { layers, rope })
     }
 
+    pub fn quantize_weights(&mut self, dtype: GgmlDType) -> Result<()> {
+        for layer in &mut self.layers {
+            layer.quantize_weights(dtype)?;
+        }
+        Ok(())
+    }
+
     pub fn init_state(&self) -> StreamingTransformerState {
         let layer_states = self.layers.iter().map(|l| l.init_state()).collect();
         StreamingTransformerState { layer_states }
@@ -481,8 +512,8 @@ impl StreamingTransformer {
 
 pub struct ProjectedTransformer {
     pub transformer: StreamingTransformer,
-    input_proj: Option<Linear>,
-    output_projs: Vec<Option<Linear>>,
+    input_proj: Option<QLinear>,
+    output_projs: Vec<Option<QLinear>>,
 }
 
 impl ProjectedTransformer {
@@ -512,7 +543,7 @@ impl ProjectedTransformer {
         )?;
 
         let input_proj = if d_model != input_dimension {
-            Some(candle_nn::linear(input_dimension, d_model, vb.pp("input_proj"))?)
+            Some(QLinear::from_linear(candle_nn::linear(input_dimension, d_model, vb.pp("input_proj"))?))
         } else {
             None
         };
@@ -523,12 +554,25 @@ impl ProjectedTransformer {
                 output_projs.push(None);
             } else {
                 let proj =
-                    candle_nn::linear(d_model, out_dim, vb.pp(&format!("output_proj.{i}")))?;
+                    QLinear::from_linear(candle_nn::linear(d_model, out_dim, vb.pp(&format!("output_proj.{i}")))?);
                 output_projs.push(Some(proj));
             }
         }
 
         Ok(Self { transformer, input_proj, output_projs })
+    }
+
+    pub fn quantize_weights(&mut self, dtype: GgmlDType) -> Result<()> {
+        self.transformer.quantize_weights(dtype)?;
+        if let Some(proj) = &mut self.input_proj {
+            proj.quantize_in_place(dtype)?;
+        }
+        for proj in &mut self.output_projs {
+            if let Some(p) = proj {
+                p.quantize_in_place(dtype)?;
+            }
+        }
+        Ok(())
     }
 
     pub fn init_state(&self) -> StreamingTransformerState {

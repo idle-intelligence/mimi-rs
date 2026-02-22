@@ -4,6 +4,7 @@ use crate::dummy_quantizer::DummyQuantizer;
 use crate::resample::{ConvDownsample1d, ConvTrUpsample1d};
 use crate::seanet::{SEANetDecoder, SEANetDecoderState, SEANetEncoder, SEANetEncoderState};
 use crate::transformer::{ProjectedTransformer, StreamingTransformerState};
+use candle_core::quantized::GgmlDType;
 use candle_core::{Device, Result, Tensor};
 use candle_nn::VarBuilder;
 
@@ -140,6 +141,14 @@ impl MimiModel {
 
     pub fn frame_size(&self) -> usize {
         self.sample_rate / self.frame_rate
+    }
+
+    pub fn quantize_encoder_transformer(&mut self, dtype: GgmlDType) -> Result<()> {
+        self.encoder_transformer.quantize_weights(dtype)
+    }
+
+    pub fn quantize_decoder_transformer(&mut self, dtype: GgmlDType) -> Result<()> {
+        self.decoder_transformer.quantize_weights(dtype)
     }
 
     /// Apply the quantizer output projection. Input: [B, quantizer_dim, T] -> [B, output_dim, T].
