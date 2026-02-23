@@ -20,6 +20,12 @@ impl QLinear {
         }
     }
 
+    /// Create a QLinear directly from a QTensor (e.g. loaded from GGUF).
+    /// No runtime quantization needed — weights are already quantized.
+    pub fn from_qtensor(qtensor: QTensor, bias: Option<Tensor>) -> Self {
+        Self { inner: QMatMul::QTensor(Arc::new(qtensor)), bias }
+    }
+
     /// Quantize the weight tensor in-place to the given GGML dtype (e.g. Q8_0).
     /// No-op if already quantized.
     pub fn quantize_in_place(&mut self, dtype: GgmlDType) -> Result<()> {

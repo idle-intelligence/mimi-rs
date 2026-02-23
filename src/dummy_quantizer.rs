@@ -1,3 +1,4 @@
+use crate::gguf_loader::GgufTensors;
 use candle_core::{Result, Tensor};
 use candle_nn::{Conv1d, Conv1dConfig, Module, VarBuilder};
 
@@ -19,6 +20,17 @@ impl DummyQuantizer {
         } else {
             candle_nn::conv1d_no_bias(dimension, output_dimension, 1, cfg, vb)?
         };
+        Ok(Self { output_proj, dimension, output_dimension })
+    }
+
+    pub fn load_gguf(
+        gguf: &mut GgufTensors,
+        prefix: &str,
+        dimension: usize,
+        output_dimension: usize,
+    ) -> Result<Self> {
+        let cfg = Conv1dConfig { padding: 0, stride: 1, dilation: 1, groups: 1, ..Default::default() };
+        let output_proj = gguf.conv1d(&format!("{prefix}.output_proj"), dimension, output_dimension, 1, cfg)?;
         Ok(Self { output_proj, dimension, output_dimension })
     }
 

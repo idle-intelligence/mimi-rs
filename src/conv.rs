@@ -26,6 +26,19 @@ pub struct CausalConv1d {
 }
 
 impl CausalConv1d {
+    /// Construct from a pre-built Conv1d and shape parameters (e.g. from GGUF tensors).
+    pub fn from_parts(
+        inner: Conv1d,
+        stride: usize,
+        dilation: usize,
+        kernel_size: usize,
+        in_channels: usize,
+        out_channels: usize,
+        groups: usize,
+    ) -> Self {
+        Self { inner, stride, dilation, kernel_size, in_channels, out_channels, groups }
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub fn load(
         vb: VarBuilder,
@@ -63,6 +76,20 @@ pub struct CausalConvTranspose1d {
 }
 
 impl CausalConvTranspose1d {
+    /// Construct from a pre-built ConvTranspose1d and shape parameters (e.g. from GGUF tensors).
+    /// `bias` should be the same tensor stored inside `inner` (cloned) so streaming overlap
+    /// correction can subtract it from partial overlap regions.
+    pub fn from_parts(
+        inner: ConvTranspose1d,
+        bias: Option<Tensor>,
+        stride: usize,
+        kernel_size: usize,
+        out_channels: usize,
+        groups: usize,
+    ) -> Self {
+        Self { inner, bias, stride, kernel_size, out_channels, groups }
+    }
+
     pub fn load(
         vb: VarBuilder,
         in_channels: usize,
@@ -124,6 +151,11 @@ pub struct StreamingConv1d {
 }
 
 impl StreamingConv1d {
+    /// Construct from a pre-built CausalConv1d (e.g. from GGUF tensors).
+    pub fn from_parts(conv: CausalConv1d, pad_mode: PadMode) -> Self {
+        Self { conv, pad_mode }
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub fn load(
         vb: VarBuilder,
@@ -223,6 +255,11 @@ pub struct StreamingConvTranspose1d {
 }
 
 impl StreamingConvTranspose1d {
+    /// Construct from a pre-built CausalConvTranspose1d (e.g. from GGUF tensors).
+    pub fn from_parts(convtr: CausalConvTranspose1d) -> Self {
+        Self { convtr }
+    }
+
     pub fn load(
         vb: VarBuilder,
         in_channels: usize,

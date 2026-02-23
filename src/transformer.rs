@@ -1,3 +1,4 @@
+use crate::gguf_loader::GgufTensors;
 use crate::layer_scale::LayerScale;
 use crate::qlinear::QLinear;
 use crate::rope::RotaryEmbedding;
@@ -173,6 +174,18 @@ impl MimiStreamingMHA {
         Ok(Self { in_proj, out_proj, embed_dim, num_heads, context })
     }
 
+    fn load_gguf(
+        gguf: &mut GgufTensors,
+        prefix: &str,
+        embed_dim: usize,
+        num_heads: usize,
+        context: usize,
+    ) -> Result<Self> {
+        let in_proj = gguf.qlinear(&format!("{prefix}.in_proj"))?;
+        let out_proj = gguf.qlinear(&format!("{prefix}.out_proj"))?;
+        Ok(Self { in_proj, out_proj, embed_dim, num_heads, context })
+    }
+
     fn quantize_weights(&mut self, dtype: GgmlDType) -> Result<()> {
         self.in_proj.quantize_in_place(dtype)?;
         self.out_proj.quantize_in_place(dtype)?;
@@ -247,6 +260,17 @@ impl StreamingMultiheadAttention {
         let out_dim = 3 * embed_dim;
         let in_proj = QLinear::from_linear(candle_nn::linear_no_bias(embed_dim, out_dim, vb.pp("in_proj"))?);
         let out_proj = QLinear::from_linear(candle_nn::linear_no_bias(embed_dim, embed_dim, vb.pp("out_proj"))?);
+        Ok(Self { in_proj, out_proj, embed_dim, num_heads })
+    }
+
+    pub fn load_gguf(
+        gguf: &mut GgufTensors,
+        prefix: &str,
+        embed_dim: usize,
+        num_heads: usize,
+    ) -> Result<Self> {
+        let in_proj = gguf.qlinear(&format!("{prefix}.in_proj"))?;
+        let out_proj = gguf.qlinear(&format!("{prefix}.out_proj"))?;
         Ok(Self { in_proj, out_proj, embed_dim, num_heads })
     }
 
@@ -391,6 +415,59 @@ impl StreamingTransformerLayer {
         Ok(Self { self_attn, norm1, norm2, linear1, linear2, layer_scale_1, layer_scale_2 })
     }
 
+    #[allow(clippy::too_many_arguments)]
+    pub fn load_gguf(
+        gguf: &mut GgufTensors,
+        prefix: &str,
+        d_model: usize,
+        num_heads: usize,
+        _dim_feedforward: usize,
+        context: Option<usize>,
+        layer_scale: Option<f64>,
+        kind: Kind,
+    ) -> Result<Self> {
+        let self_attn = match kind {
+            Kind::Mimi => AttentionKind::Mimi(MimiStreamingMHA::load_gguf(
+                gguf,
+                &format!("{prefix}.self_attn"),
+                d_model,
+                num_heads,
+                context.unwrap_or(250),
+            )?),
+            Kind::FlowLm => AttentionKind::FlowLm(StreamingMultiheadAttention::load_gguf(
+                gguf,
+                &format!("{prefix}.self_attn"),
+                d_model,
+                num_heads,
+            )?),
+        };
+
+        let norm1_w = gguf.tensor(&format!("{prefix}.norm1.weight"))?;
+        let norm1_b = gguf.tensor(&format!("{prefix}.norm1.bias"))?;
+        let norm2_w = gguf.tensor(&format!("{prefix}.norm2.weight"))?;
+        let norm2_b = gguf.tensor(&format!("{prefix}.norm2.bias"))?;
+        let norm1 = LayerNorm::new(norm1_w, norm1_b, 1e-5);
+        let norm2 = LayerNorm::new(norm2_w, norm2_b, 1e-5);
+
+        let linear1 = gguf.qlinear(&format!("{prefix}.linear1"))?;
+        let linear2 = gguf.qlinear(&format!("{prefix}.linear2"))?;
+
+        let layer_scale_1 = if layer_scale.is_some() {
+            let scale = gguf.tensor(&format!("{prefix}.layer_scale_1.scale"))?;
+            Some(LayerScale::new(scale))
+        } else {
+            None
+        };
+        let layer_scale_2 = if layer_scale.is_some() {
+            let scale = gguf.tensor(&format!("{prefix}.layer_scale_2.scale"))?;
+            Some(LayerScale::new(scale))
+        } else {
+            None
+        };
+
+        Ok(Self { self_attn, norm1, norm2, linear1, linear2, layer_scale_1, layer_scale_2 })
+    }
+
     pub fn quantize_weights(&mut self, dtype: GgmlDType) -> Result<()> {
         match &mut self.self_attn {
             AttentionKind::Mimi(attn) => attn.quantize_weights(dtype)?,
@@ -483,6 +560,40 @@ impl StreamingTransformer {
         Ok(Self { layers, rope })
     }
 
+    #[allow(clippy::too_many_arguments)]
+    pub fn load_gguf(
+        gguf: &mut GgufTensors,
+        prefix: &str,
+        d_model: usize,
+        num_heads: usize,
+        num_layers: usize,
+        layer_scale: Option<f64>,
+        dim_feedforward: usize,
+        context: Option<usize>,
+        max_period: f64,
+        kind: Kind,
+    ) -> Result<Self> {
+        let head_dim = d_model / num_heads;
+        let max_seq_len = 8192;
+        let rope = RotaryEmbedding::new(head_dim, max_seq_len, max_period, &gguf.device.clone())?;
+
+        let mut layers = Vec::with_capacity(num_layers);
+        for i in 0..num_layers {
+            layers.push(StreamingTransformerLayer::load_gguf(
+                gguf,
+                &format!("{prefix}.layers.{i}"),
+                d_model,
+                num_heads,
+                dim_feedforward,
+                context,
+                layer_scale,
+                kind,
+            )?);
+        }
+
+        Ok(Self { layers, rope })
+    }
+
     pub fn quantize_weights(&mut self, dtype: GgmlDType) -> Result<()> {
         for layer in &mut self.layers {
             layer.quantize_weights(dtype)?;
@@ -555,6 +666,52 @@ impl ProjectedTransformer {
             } else {
                 let proj =
                     QLinear::from_linear(candle_nn::linear(d_model, out_dim, vb.pp(&format!("output_proj.{i}")))?);
+                output_projs.push(Some(proj));
+            }
+        }
+
+        Ok(Self { transformer, input_proj, output_projs })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn load_gguf(
+        gguf: &mut GgufTensors,
+        prefix: &str,
+        input_dimension: usize,
+        output_dimensions: &[usize],
+        d_model: usize,
+        num_heads: usize,
+        num_layers: usize,
+        layer_scale: Option<f64>,
+        context: usize,
+        max_period: f64,
+        dim_feedforward: usize,
+    ) -> Result<Self> {
+        let transformer = StreamingTransformer::load_gguf(
+            gguf,
+            &format!("{prefix}.transformer"),
+            d_model,
+            num_heads,
+            num_layers,
+            layer_scale,
+            dim_feedforward,
+            Some(context),
+            max_period,
+            Kind::Mimi,
+        )?;
+
+        let input_proj = if d_model != input_dimension {
+            Some(gguf.qlinear(&format!("{prefix}.input_proj"))?)
+        } else {
+            None
+        };
+
+        let mut output_projs = Vec::new();
+        for (i, &out_dim) in output_dimensions.iter().enumerate() {
+            if d_model == out_dim {
+                output_projs.push(None);
+            } else {
+                let proj = gguf.qlinear(&format!("{prefix}.output_proj.{i}"))?;
                 output_projs.push(Some(proj));
             }
         }

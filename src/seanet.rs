@@ -2,6 +2,7 @@ use crate::conv::{
     PadMode, StreamingConv1d, StreamingConv1dState, StreamingConvTr1dState,
     StreamingConvTranspose1d,
 };
+use crate::gguf_loader::GgufTensors;
 use candle_core::{Device, Result, Tensor};
 use candle_nn::VarBuilder;
 
@@ -33,6 +34,36 @@ impl SEANetResnetBlock {
             // block.{2*i+1} in Python (ELU at even indices, Conv at odd)
             let conv = StreamingConv1d::load(
                 vb.pp(&format!("block.{}", 2 * i + 1)),
+                in_c,
+                out_c,
+                ks,
+                1,
+                dil,
+                pad_mode,
+                1,
+                true,
+            )?;
+            convs.push(conv);
+        }
+        Ok(Self { convs })
+    }
+
+    pub fn load_gguf(
+        gguf: &mut GgufTensors,
+        prefix: &str,
+        dim: usize,
+        kernel_sizes: &[usize],
+        dilations: &[usize],
+        pad_mode: PadMode,
+        compress: usize,
+    ) -> Result<Self> {
+        let hidden = dim / compress;
+        let mut convs = Vec::new();
+        for (i, (&ks, &dil)) in kernel_sizes.iter().zip(dilations.iter()).enumerate() {
+            let in_c = if i == 0 { dim } else { hidden };
+            let out_c = if i == kernel_sizes.len() - 1 { dim } else { hidden };
+            let conv = gguf.streaming_conv1d(
+                &format!("{prefix}.block.{}", 2 * i + 1),
                 in_c,
                 out_c,
                 ks,
@@ -179,6 +210,89 @@ impl SEANetEncoder {
         Ok(Self { init_conv, layers, final_conv, hop_length, dimension })
     }
 
+    #[allow(clippy::too_many_arguments)]
+    pub fn load_gguf(
+        gguf: &mut GgufTensors,
+        prefix: &str,
+        channels: usize,
+        dimension: usize,
+        n_filters: usize,
+        n_residual_layers: usize,
+        ratios: &[usize],
+        kernel_size: usize,
+        last_kernel_size: usize,
+        residual_kernel_size: usize,
+        dilation_base: usize,
+        pad_mode: PadMode,
+        compress: usize,
+    ) -> Result<Self> {
+        let ratios: Vec<usize> = ratios.iter().rev().copied().collect();
+        let hop_length: usize = ratios.iter().product();
+
+        let mut mult = 1usize;
+        let init_conv = gguf.streaming_conv1d(
+            &format!("{prefix}.model.0"),
+            channels,
+            mult * n_filters,
+            kernel_size,
+            1,
+            1,
+            pad_mode,
+            1,
+            true,
+        )?;
+
+        let mut layers = Vec::new();
+        let mut layer_idx = 1usize;
+
+        for &ratio in &ratios {
+            let mut residuals = Vec::new();
+            for j in 0..n_residual_layers {
+                let dilation = dilation_base.pow(j as u32);
+                let block = SEANetResnetBlock::load_gguf(
+                    gguf,
+                    &format!("{prefix}.model.{layer_idx}"),
+                    mult * n_filters,
+                    &[residual_kernel_size, 1],
+                    &[dilation, 1],
+                    pad_mode,
+                    compress,
+                )?;
+                residuals.push(block);
+                layer_idx += 1;
+            }
+
+            let downsample = gguf.streaming_conv1d(
+                &format!("{prefix}.model.{}", layer_idx + 1),
+                mult * n_filters,
+                mult * n_filters * 2,
+                ratio * 2,
+                ratio,
+                1,
+                pad_mode,
+                1,
+                true,
+            )?;
+            layer_idx += 2;
+            layers.push(EncoderLayer { residuals, downsample });
+            mult *= 2;
+        }
+
+        let final_conv = gguf.streaming_conv1d(
+            &format!("{prefix}.model.{}", layer_idx + 1),
+            mult * n_filters,
+            dimension,
+            last_kernel_size,
+            1,
+            1,
+            pad_mode,
+            1,
+            true,
+        )?;
+
+        Ok(Self { init_conv, layers, final_conv, hop_length, dimension })
+    }
+
     pub fn init_state(&self, batch_size: usize, device: &Device) -> Result<SEANetEncoderState> {
         let init_conv_state = self.init_conv.init_state(batch_size, device)?;
         let layer_states = self
@@ -304,6 +418,86 @@ impl SEANetDecoder {
         // ELU at layer_idx, final conv at layer_idx+1
         let final_conv = StreamingConv1d::load(
             vb.pp(&format!("model.{}", layer_idx + 1)),
+            n_filters,
+            channels,
+            last_kernel_size,
+            1,
+            1,
+            pad_mode,
+            1,
+            true,
+        )?;
+
+        Ok(Self { init_conv, layers, final_conv })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn load_gguf(
+        gguf: &mut GgufTensors,
+        prefix: &str,
+        channels: usize,
+        dimension: usize,
+        n_filters: usize,
+        n_residual_layers: usize,
+        ratios: &[usize],
+        kernel_size: usize,
+        last_kernel_size: usize,
+        residual_kernel_size: usize,
+        dilation_base: usize,
+        pad_mode: PadMode,
+        compress: usize,
+    ) -> Result<Self> {
+        let mut mult = 1 << ratios.len();
+
+        let init_conv = gguf.streaming_conv1d(
+            &format!("{prefix}.model.0"),
+            dimension,
+            mult * n_filters,
+            kernel_size,
+            1,
+            1,
+            pad_mode,
+            1,
+            true,
+        )?;
+
+        let mut layers = Vec::new();
+        let mut layer_idx = 1usize;
+
+        for &ratio in ratios {
+            let upsample = gguf.streaming_conv_transpose1d(
+                &format!("{prefix}.model.{}", layer_idx + 1),
+                mult * n_filters,
+                mult * n_filters / 2,
+                ratio * 2,
+                ratio,
+                1,
+                true,
+            )?;
+            layer_idx += 2;
+
+            let mut residuals = Vec::new();
+            for j in 0..n_residual_layers {
+                let dilation = dilation_base.pow(j as u32);
+                let block = SEANetResnetBlock::load_gguf(
+                    gguf,
+                    &format!("{prefix}.model.{layer_idx}"),
+                    mult * n_filters / 2,
+                    &[residual_kernel_size, 1],
+                    &[dilation, 1],
+                    pad_mode,
+                    compress,
+                )?;
+                residuals.push(block);
+                layer_idx += 1;
+            }
+
+            layers.push(DecoderLayer { upsample, residuals });
+            mult /= 2;
+        }
+
+        let final_conv = gguf.streaming_conv1d(
+            &format!("{prefix}.model.{}", layer_idx + 1),
             n_filters,
             channels,
             last_kernel_size,

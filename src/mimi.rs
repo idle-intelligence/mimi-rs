@@ -1,6 +1,7 @@
 use crate::config::MimiConfig;
 use crate::conv::{pad_for_conv1d, PadMode, StreamingConv1dState, StreamingConvTr1dState};
 use crate::dummy_quantizer::DummyQuantizer;
+use crate::gguf_loader::GgufTensors;
 use crate::quantizer::SplitResidualVectorQuantizer;
 use crate::resample::{ConvDownsample1d, ConvTrUpsample1d};
 use crate::seanet::{SEANetDecoder, SEANetDecoderState, SEANetEncoder, SEANetEncoderState};
@@ -246,6 +247,124 @@ impl MimiModel {
             quantizer,
             downsample,
             upsample: None,
+            frame_rate: cfg.frame_rate,
+            _encoder_frame_rate: encoder_frame_rate,
+            sample_rate: cfg.sample_rate,
+            _dimension: cfg.dimension,
+        })
+    }
+
+    /// Load full model from GGUF (encoder + decoder).
+    ///
+    /// Used by TTS which needs: SEANetEncoder, SEANetDecoder, both transformers,
+    /// DummyQuantizer, and downsample/upsample.
+    pub fn load_gguf(gguf: &mut GgufTensors, prefix: &str, cfg: &MimiConfig) -> Result<Self> {
+        let pad_mode = PadMode::Constant;
+
+        let encoder = SEANetEncoder::load_gguf(
+            gguf,
+            &format!("{prefix}.encoder"),
+            cfg.channels,
+            cfg.dimension,
+            cfg.n_filters,
+            cfg.n_residual_layers,
+            &cfg.ratios,
+            cfg.kernel_size,
+            cfg.last_kernel_size,
+            cfg.residual_kernel_size,
+            cfg.dilation_base,
+            pad_mode,
+            cfg.compress,
+        )?;
+
+        let decoder = SEANetDecoder::load_gguf(
+            gguf,
+            &format!("{prefix}.decoder"),
+            cfg.channels,
+            cfg.dimension,
+            cfg.n_filters,
+            cfg.n_residual_layers,
+            &cfg.ratios,
+            cfg.kernel_size,
+            cfg.last_kernel_size,
+            cfg.residual_kernel_size,
+            cfg.dilation_base,
+            pad_mode,
+            cfg.compress,
+        )?;
+
+        let output_dimensions = vec![cfg.dimension];
+        let encoder_transformer = ProjectedTransformer::load_gguf(
+            gguf,
+            &format!("{prefix}.encoder_transformer"),
+            cfg.dimension,
+            &output_dimensions,
+            cfg.transformer_d_model,
+            cfg.transformer_num_heads,
+            cfg.transformer_num_layers,
+            Some(cfg.transformer_layer_scale),
+            cfg.transformer_context,
+            cfg.transformer_max_period,
+            cfg.transformer_dim_feedforward,
+        )?;
+
+        let decoder_transformer = ProjectedTransformer::load_gguf(
+            gguf,
+            &format!("{prefix}.decoder_transformer"),
+            cfg.dimension,
+            &output_dimensions,
+            cfg.transformer_d_model,
+            cfg.transformer_num_heads,
+            cfg.transformer_num_layers,
+            Some(cfg.transformer_layer_scale),
+            cfg.transformer_context,
+            cfg.transformer_max_period,
+            cfg.transformer_dim_feedforward,
+        )?;
+
+        let quantizer = if cfg.num_codebooks > 0 {
+            candle_core::bail!("SplitRVQ GGUF loading not implemented; use VarBuilder-based load() for full codec")
+        } else {
+            let dummy = DummyQuantizer::load_gguf(
+                gguf,
+                &format!("{prefix}.quantizer"),
+                cfg.quantizer_dimension,
+                cfg.quantizer_output_dimension,
+            )?;
+            QuantizerKind::Dummy(dummy)
+        };
+
+        let hop_length: usize = cfg.ratios.iter().product();
+        let encoder_frame_rate = cfg.sample_rate as f64 / hop_length as f64;
+
+        let (downsample, upsample) =
+            if (encoder_frame_rate - cfg.frame_rate as f64).abs() > 0.01 {
+                let downsample_stride = (encoder_frame_rate / cfg.frame_rate as f64) as usize;
+                let ds = ConvDownsample1d::load_gguf(
+                    gguf,
+                    &format!("{prefix}.downsample"),
+                    downsample_stride,
+                    cfg.dimension,
+                )?;
+                let us = ConvTrUpsample1d::load_gguf(
+                    gguf,
+                    &format!("{prefix}.upsample"),
+                    downsample_stride,
+                    cfg.dimension,
+                )?;
+                (Some(ds), Some(us))
+            } else {
+                (None, None)
+            };
+
+        Ok(Self {
+            encoder,
+            decoder: Some(decoder),
+            encoder_transformer,
+            decoder_transformer: Some(decoder_transformer),
+            quantizer,
+            downsample,
+            upsample,
             frame_rate: cfg.frame_rate,
             _encoder_frame_rate: encoder_frame_rate,
             sample_rate: cfg.sample_rate,

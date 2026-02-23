@@ -2,6 +2,7 @@ pub mod config;
 pub mod conv;
 pub mod dequantize;
 pub mod dummy_quantizer;
+pub mod gguf_loader;
 pub mod layer_scale;
 pub mod mimi;
 pub mod qlinear;
