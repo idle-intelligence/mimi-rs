@@ -1,10 +1,12 @@
 use candle_core::{Device, Result, Tensor};
 
 /// Rotary position embedding (RoPE).
-/// Precomputes cos/sin tables and applies interleaved RoPE.
+/// Precomputes cos/sin tables and computes on the fly for positions beyond the table.
 pub struct RotaryEmbedding {
     cos: Tensor,
     sin: Tensor,
+    half_dim: usize,
+    max_period: f64,
 }
 
 impl RotaryEmbedding {
@@ -29,7 +31,36 @@ impl RotaryEmbedding {
 
         let cos = Tensor::from_vec(cos_data, (max_seq_len, half_dim), device)?;
         let sin = Tensor::from_vec(sin_data, (max_seq_len, half_dim), device)?;
-        Ok(Self { cos, sin })
+        Ok(Self { cos, sin, half_dim, max_period })
+    }
+
+    /// Compute cos/sin for positions [offset..offset+t], using the pre-computed
+    /// table when possible, falling back to on-the-fly computation for large offsets.
+    fn get_cos_sin(&self, offset: usize, t: usize, device: &Device) -> Result<(Tensor, Tensor)> {
+        let table_len = self.cos.dim(0)?;
+        if offset + t <= table_len {
+            // Fast path: slice from pre-computed table
+            Ok((
+                self.cos.narrow(0, offset, t)?,
+                self.sin.narrow(0, offset, t)?,
+            ))
+        } else {
+            // Compute on the fly for positions beyond the table
+            let mut cos_data = Vec::with_capacity(t * self.half_dim);
+            let mut sin_data = Vec::with_capacity(t * self.half_dim);
+            for pos in offset..offset + t {
+                for i in 0..self.half_dim {
+                    let inv_freq = 1.0f64 / self.max_period.powf(i as f64 / self.half_dim as f64);
+                    let angle = pos as f64 * inv_freq;
+                    cos_data.push(angle.cos() as f32);
+                    sin_data.push(angle.sin() as f32);
+                }
+            }
+            Ok((
+                Tensor::from_vec(cos_data, (t, self.half_dim), device)?,
+                Tensor::from_vec(sin_data, (t, self.half_dim), device)?,
+            ))
+        }
     }
 
     /// Apply interleaved RoPE to a tensor of shape [B, T, H, D].
@@ -39,8 +70,7 @@ impl RotaryEmbedding {
         let half_d = d / 2;
 
         // Get cos/sin for current positions [T, half_d]
-        let cos = self.cos.narrow(0, offset, t)?;
-        let sin = self.sin.narrow(0, offset, t)?;
+        let (cos, sin) = self.get_cos_sin(offset, t, x.device())?;
 
         // Reshape x to separate even/odd: [B, T, H, half_d, 2]
         let x = x.reshape((b, t, h, half_d, 2))?;
@@ -79,3 +109,53 @@ impl RotaryEmbedding {
         Ok((q, k))
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Verify that on-the-fly RoPE matches the pre-computed table.
+    #[test]
+    fn on_the_fly_matches_table() -> Result<()> {
+        let head_dim = 8;
+        let table_size = 16;
+        let max_period = 10000.0;
+        let dev = Device::Cpu;
+
+        let rope = RotaryEmbedding::new(head_dim, table_size, max_period, &dev)?;
+
+        // Get positions 10..13 from the table (fast path)
+        let (cos_table, sin_table) = rope.get_cos_sin(10, 3, &dev)?;
+
+        // Force on-the-fly by requesting same positions but via a fresh rope with tiny table
+        let rope_tiny = RotaryEmbedding::new(head_dim, 4, max_period, &dev)?;
+        let (cos_fly, sin_fly) = rope_tiny.get_cos_sin(10, 3, &dev)?;
+
+        let cos_diff: f32 = (cos_table - cos_fly)?.abs()?.sum_all()?.to_scalar()?;
+        let sin_diff: f32 = (sin_table - sin_fly)?.abs()?.sum_all()?.to_scalar()?;
+        assert!(cos_diff < 1e-6, "cos mismatch: {cos_diff}");
+        assert!(sin_diff < 1e-6, "sin mismatch: {sin_diff}");
+        Ok(())
+    }
+
+    /// RoPE must not panic for offsets far beyond the pre-computed table.
+    /// This is the bug that caused WASM crashes after ~5.5 minutes of streaming.
+    #[test]
+    fn large_offset_no_panic() -> Result<()> {
+        let head_dim = 64;
+        let table_size = 128; // small table
+        let max_period = 10000.0;
+        let dev = Device::Cpu;
+
+        let rope = RotaryEmbedding::new(head_dim, table_size, max_period, &dev)?;
+
+        // Simulate streaming: offsets way beyond the table
+        let x = Tensor::randn(0f32, 1.0, (1, 1, 8, head_dim), &dev)?;
+        for offset in [0, 127, 128, 1000, 8192, 50000] {
+            let (q, _k) = rope.forward(&x, &x, offset)?;
+            assert_eq!(q.dims(), &[1, 1, 8, head_dim]);
+        }
+        Ok(())
+    }
+}
+
