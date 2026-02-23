@@ -183,3 +183,286 @@ impl SplitResidualVectorQuantizer {
         Tensor::cat(&[&first_codes, &rest_codes], 1)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use candle_core::{Device, Tensor};
+    use std::collections::HashMap;
+
+    const DEV: Device = Device::Cpu;
+
+    // ---- VectorQuantizer tests ----
+
+    /// Build a small 4-entry, 3-dim codebook and verify that encode() returns the
+    /// correct nearest-neighbor index for each input vector.
+    #[test]
+    fn vq_nearest_neighbor_indices() -> Result<()> {
+        // Codebook: 4 entries in 3-D
+        //   0: [1, 0, 0]
+        //   1: [0, 1, 0]
+        //   2: [0, 0, 1]
+        //   3: [1, 1, 1]
+        let codebook = Tensor::new(
+            &[[1.0f32, 0., 0.], [0., 1., 0.], [0., 0., 1.], [1., 1., 1.]],
+            &DEV,
+        )?;
+        let vq = VectorQuantizer::new(codebook)?;
+
+        // Input: [B=1, dim=3, T=4] — each time step is near one codebook entry
+        let input = Tensor::new(
+            &[[[0.9f32, 0.1, 0.05, 0.8],
+               [0.1,    0.9, 0.1,  0.9],
+               [0.0,    0.0, 0.85, 0.7]]],
+            &DEV,
+        )?;
+        // Expected nearest:
+        //   t=0: [0.9, 0.1, 0.0] → entry 0 [1,0,0]
+        //   t=1: [0.1, 0.9, 0.0] → entry 1 [0,1,0]
+        //   t=2: [0.05,0.1, 0.85]→ entry 2 [0,0,1]
+        //   t=3: [0.8, 0.9, 0.7] → entry 3 [1,1,1]
+
+        let (quantized, indices) = vq.encode(&input)?;
+
+        // Check index values
+        let idx_vec: Vec<u32> = indices.flatten_all()?.to_vec1()?;
+        assert_eq!(idx_vec, vec![0, 1, 2, 3]);
+
+        // Check that quantized vectors equal the selected codebook entries
+        // quantized shape: [1, 3, 4]
+        let q_flat = quantized.squeeze(0)?.t()?.contiguous()?; // [4, 3]
+        let expected = Tensor::new(
+            &[[1.0f32, 0., 0.], [0., 1., 0.], [0., 0., 1.], [1., 1., 1.]],
+            &DEV,
+        )?;
+        let diff = q_flat.sub(&expected)?.abs()?.sum_all()?.to_scalar::<f32>()?;
+        assert!(diff < 1e-6, "quantized vectors should match codebook entries, diff={diff}");
+
+        Ok(())
+    }
+
+    /// Verify output shapes from VectorQuantizer::encode() with batch and time dims.
+    #[test]
+    fn vq_encode_output_shapes() -> Result<()> {
+        let n_bins = 8;
+        let dim = 5;
+        let codebook = Tensor::randn(0f32, 1.0, (n_bins, dim), &DEV)?;
+        let vq = VectorQuantizer::new(codebook)?;
+
+        let b = 2;
+        let t = 7;
+        let input = Tensor::randn(0f32, 1.0, (b, dim, t), &DEV)?;
+        let (quantized, indices) = vq.encode(&input)?;
+
+        assert_eq!(quantized.dims(), &[b, dim, t]);
+        assert_eq!(indices.dims(), &[b, 1, t]);
+        assert_eq!(indices.dtype(), DType::U32);
+
+        Ok(())
+    }
+
+    /// Verify that all returned indices are valid (< n_bins).
+    #[test]
+    fn vq_indices_in_range() -> Result<()> {
+        let n_bins: u32 = 4;
+        let dim = 3;
+        let codebook = Tensor::randn(0f32, 1.0, (n_bins as usize, dim), &DEV)?;
+        let vq = VectorQuantizer::new(codebook)?;
+
+        let input = Tensor::randn(0f32, 1.0, (3, dim, 10), &DEV)?;
+        let (_quantized, indices) = vq.encode(&input)?;
+
+        let idx_vec: Vec<u32> = indices.flatten_all()?.to_vec1()?;
+        for &idx in &idx_vec {
+            assert!(idx < n_bins, "index {idx} should be < n_bins={n_bins}");
+        }
+
+        Ok(())
+    }
+
+    // ---- ResidualVectorQuantizer tests ----
+
+    /// Helper: build a VarBuilder containing all tensors required by
+    /// ResidualVectorQuantizer::load(prefix, n_codebooks, input_dim, codebook_dim, bins).
+    ///
+    /// Conv1d weights are identity-like (scaled) and codebooks are synthetic.
+    fn make_rvq_tensors(
+        prefix: &str,
+        n_codebooks: usize,
+        input_dim: usize,
+        codebook_dim: usize,
+        codebook_bins: usize,
+    ) -> Result<HashMap<String, Tensor>> {
+        let mut tensors = HashMap::new();
+
+        // input_proj.weight: [codebook_dim, input_dim, 1]
+        // Use identity-like projection when dims match, otherwise random
+        let input_w = if input_dim == codebook_dim {
+            Tensor::eye(input_dim, DType::F32, &DEV)?.unsqueeze(2)?
+        } else {
+            Tensor::randn(0f32, 0.1, (codebook_dim, input_dim, 1), &DEV)?
+        };
+        tensors.insert(format!("{prefix}input_proj.weight"), input_w);
+
+        // output_proj.weight: [input_dim, codebook_dim, 1]
+        let output_w = if input_dim == codebook_dim {
+            Tensor::eye(input_dim, DType::F32, &DEV)?.unsqueeze(2)?
+        } else {
+            Tensor::randn(0f32, 0.1, (input_dim, codebook_dim, 1), &DEV)?
+        };
+        tensors.insert(format!("{prefix}output_proj.weight"), output_w);
+
+        // Codebook tensors for each layer
+        for i in 0..n_codebooks {
+            // Use well-separated codebook entries for predictable behaviour
+            let embed_sum =
+                Tensor::randn(0f32, 1.0, (codebook_bins, codebook_dim), &DEV)?;
+            let cluster_usage = Tensor::ones((codebook_bins,), DType::F32, &DEV)?;
+            tensors.insert(
+                format!("{prefix}layers.{i}.codebook.embed_sum"),
+                embed_sum,
+            );
+            tensors.insert(
+                format!("{prefix}layers.{i}.codebook.cluster_usage"),
+                cluster_usage,
+            );
+        }
+
+        Ok(tensors)
+    }
+
+    /// Build a ResidualVectorQuantizer from synthetic weights and verify the output
+    /// shape is [B, n_codebooks, T].
+    #[test]
+    fn rvq_encode_output_shape() -> Result<()> {
+        let n_codebooks = 3;
+        let input_dim = 4;
+        let codebook_dim = 4;
+        let codebook_bins = 8;
+
+        let tensors = make_rvq_tensors("", n_codebooks, input_dim, codebook_dim, codebook_bins)?;
+        let vb = VarBuilder::from_tensors(tensors, DType::F32, &DEV);
+
+        let rvq = ResidualVectorQuantizer::load(vb, n_codebooks, input_dim, codebook_dim, codebook_bins)?;
+
+        let b = 1;
+        let t = 5;
+        let input = Tensor::randn(0f32, 1.0, (b, input_dim, t), &DEV)?;
+        let codes = rvq.encode(&input)?;
+
+        assert_eq!(codes.dims(), &[b, n_codebooks, t]);
+        assert_eq!(codes.dtype(), DType::U32);
+
+        Ok(())
+    }
+
+    /// Verify the overall residual decreases after RVQ encoding.
+    /// With random codebooks, individual layers may not always decrease the residual,
+    /// but the overall trend should reduce energy.
+    #[test]
+    fn rvq_residual_decreases() -> Result<()> {
+        let n_codebooks = 4;
+        let dim = 4; // input_dim == codebook_dim so identity projection
+        let codebook_bins = 16;
+
+        let tensors = make_rvq_tensors("", n_codebooks, dim, dim, codebook_bins)?;
+        let vb = VarBuilder::from_tensors(tensors, DType::F32, &DEV);
+
+        let rvq = ResidualVectorQuantizer::load(vb, n_codebooks, dim, dim, codebook_bins)?;
+
+        let input = Tensor::randn(0f32, 1.0, (1, dim, 10), &DEV)?;
+
+        // Project through input_proj (identity in this case)
+        let projected = rvq.input_proj.forward(&input)?;
+
+        let initial_norm: f32 = projected.sqr()?.sum_all()?.to_scalar()?;
+
+        let mut residual = projected;
+        for quantizer in &rvq.quantizers {
+            let (quantized, _indices) = quantizer.encode(&residual)?;
+            residual = residual.sub(&quantized)?;
+        }
+
+        let final_norm: f32 = residual.sqr()?.sum_all()?.to_scalar()?;
+
+        // The final residual should be strictly less than the initial
+        assert!(
+            final_norm < initial_norm,
+            "final residual ({:.6}) should be less than initial ({:.6})",
+            final_norm,
+            initial_norm,
+        );
+
+        Ok(())
+    }
+
+    /// Verify that the RVQ encodes correctly with batch size > 1.
+    #[test]
+    fn rvq_encode_batched() -> Result<()> {
+        let n_codebooks = 2;
+        let input_dim = 4;
+        let codebook_dim = 4;
+        let codebook_bins = 8;
+
+        let tensors = make_rvq_tensors("", n_codebooks, input_dim, codebook_dim, codebook_bins)?;
+        let vb = VarBuilder::from_tensors(tensors, DType::F32, &DEV);
+
+        let rvq = ResidualVectorQuantizer::load(vb, n_codebooks, input_dim, codebook_dim, codebook_bins)?;
+
+        let b = 3;
+        let t = 6;
+        let input = Tensor::randn(0f32, 1.0, (b, input_dim, t), &DEV)?;
+        let codes = rvq.encode(&input)?;
+
+        assert_eq!(codes.dims(), &[b, n_codebooks, t]);
+
+        // All indices should be valid
+        let idx_vec: Vec<u32> = codes.flatten_all()?.to_vec1()?;
+        for &idx in &idx_vec {
+            assert!(idx < codebook_bins as u32);
+        }
+
+        Ok(())
+    }
+
+    // ---- SplitResidualVectorQuantizer tests ----
+
+    /// Verify SplitResidualVectorQuantizer produces [B, n_q_semantic + n_q_acoustic, T].
+    #[test]
+    fn split_rvq_encode_output_shape() -> Result<()> {
+        let n_q_semantic = 1;
+        let n_q_acoustic = 3;
+        let input_dim = 4;
+        let codebook_dim = 4;
+        let codebook_bins = 8;
+
+        let mut tensors = HashMap::new();
+        let sem = make_rvq_tensors(
+            "semantic_residual_vector_quantizer.",
+            n_q_semantic, input_dim, codebook_dim, codebook_bins,
+        )?;
+        let aco = make_rvq_tensors(
+            "acoustic_residual_vector_quantizer.",
+            n_q_acoustic, input_dim, codebook_dim, codebook_bins,
+        )?;
+        tensors.extend(sem);
+        tensors.extend(aco);
+
+        let vb = VarBuilder::from_tensors(tensors, DType::F32, &DEV);
+        let split = SplitResidualVectorQuantizer::load(
+            vb, n_q_semantic, n_q_acoustic, input_dim, codebook_dim, codebook_bins,
+        )?;
+
+        assert_eq!(split.n_q, n_q_semantic + n_q_acoustic);
+
+        let b = 1;
+        let t = 5;
+        let input = Tensor::randn(0f32, 1.0, (b, input_dim, t), &DEV)?;
+        let codes = split.encode(&input)?;
+
+        assert_eq!(codes.dims(), &[b, n_q_semantic + n_q_acoustic, t]);
+        assert_eq!(codes.dtype(), DType::U32);
+
+        Ok(())
+    }
+}
