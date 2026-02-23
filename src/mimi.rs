@@ -17,9 +17,9 @@ pub enum QuantizerKind {
 
 pub struct MimiModel {
     encoder: SEANetEncoder,
-    decoder: SEANetDecoder,
+    decoder: Option<SEANetDecoder>,
     encoder_transformer: ProjectedTransformer,
-    decoder_transformer: ProjectedTransformer,
+    decoder_transformer: Option<ProjectedTransformer>,
     pub quantizer: QuantizerKind,
     downsample: Option<ConvDownsample1d>,
     upsample: Option<ConvTrUpsample1d>,
@@ -153,12 +153,99 @@ impl MimiModel {
 
         Ok(Self {
             encoder,
-            decoder,
+            decoder: Some(decoder),
             encoder_transformer,
-            decoder_transformer,
+            decoder_transformer: Some(decoder_transformer),
             quantizer,
             downsample,
             upsample,
+            frame_rate: cfg.frame_rate,
+            _encoder_frame_rate: encoder_frame_rate,
+            sample_rate: cfg.sample_rate,
+            _dimension: cfg.dimension,
+        })
+    }
+
+    /// Load encoder-only model (no decoder weights needed).
+    ///
+    /// Used by STT which only needs: SEANetEncoder + encoder transformer + downsample + RVQ quantizer.
+    /// Decoder/upsample fields are set to None.
+    pub fn load_encoder_only(vb: VarBuilder, cfg: &MimiConfig) -> Result<Self> {
+        let pad_mode = PadMode::Constant;
+
+        let encoder = SEANetEncoder::load(
+            vb.pp("encoder"),
+            cfg.channels,
+            cfg.dimension,
+            cfg.n_filters,
+            cfg.n_residual_layers,
+            &cfg.ratios,
+            cfg.kernel_size,
+            cfg.last_kernel_size,
+            cfg.residual_kernel_size,
+            cfg.dilation_base,
+            pad_mode,
+            cfg.compress,
+        )?;
+
+        let output_dimensions = vec![cfg.dimension];
+        let encoder_transformer = ProjectedTransformer::load(
+            vb.pp("encoder_transformer"),
+            cfg.dimension,
+            &output_dimensions,
+            cfg.transformer_d_model,
+            cfg.transformer_num_heads,
+            cfg.transformer_num_layers,
+            Some(cfg.transformer_layer_scale),
+            cfg.transformer_context,
+            cfg.transformer_max_period,
+            cfg.transformer_dim_feedforward,
+        )?;
+
+        // Load quantizer based on config
+        let quantizer = if cfg.num_codebooks > 0 {
+            let n_acoustic = cfg.num_codebooks - cfg.num_codebooks_semantic;
+            let split_rvq = SplitResidualVectorQuantizer::load(
+                vb.pp("quantizer"),
+                cfg.num_codebooks_semantic,
+                n_acoustic,
+                cfg.dimension,
+                cfg.codebook_dim,
+                cfg.codebook_bins,
+            )?;
+            QuantizerKind::SplitRvq(split_rvq)
+        } else {
+            let dummy = DummyQuantizer::load(
+                vb.pp("quantizer"),
+                cfg.quantizer_dimension,
+                cfg.quantizer_output_dimension,
+            )?;
+            QuantizerKind::Dummy(dummy)
+        };
+
+        let hop_length: usize = cfg.ratios.iter().product();
+        let encoder_frame_rate = cfg.sample_rate as f64 / hop_length as f64;
+
+        let downsample =
+            if (encoder_frame_rate - cfg.frame_rate as f64).abs() > 0.01 {
+                let downsample_stride = (encoder_frame_rate / cfg.frame_rate as f64) as usize;
+                Some(ConvDownsample1d::load(
+                    vb.pp("downsample"),
+                    downsample_stride,
+                    cfg.dimension,
+                )?)
+            } else {
+                None
+            };
+
+        Ok(Self {
+            encoder,
+            decoder: None,
+            encoder_transformer,
+            decoder_transformer: None,
+            quantizer,
+            downsample,
+            upsample: None,
             frame_rate: cfg.frame_rate,
             _encoder_frame_rate: encoder_frame_rate,
             sample_rate: cfg.sample_rate,
@@ -179,7 +266,10 @@ impl MimiModel {
     }
 
     pub fn quantize_decoder_transformer(&mut self, dtype: GgmlDType) -> Result<()> {
-        self.decoder_transformer.quantize_weights(dtype)
+        match &mut self.decoder_transformer {
+            Some(dt) => dt.quantize_weights(dtype),
+            None => Ok(()),
+        }
     }
 
     /// Apply the quantizer output projection (DummyQuantizer only).
@@ -205,6 +295,10 @@ impl MimiModel {
     }
 
     pub fn init_state(&self, batch_size: usize, device: &Device) -> Result<MimiState> {
+        let decoder = self.decoder.as_ref()
+            .ok_or_else(|| candle_core::Error::Msg("init_state requires decoder (use load(), not load_encoder_only())".into()))?;
+        let decoder_transformer = self.decoder_transformer.as_ref()
+            .ok_or_else(|| candle_core::Error::Msg("init_state requires decoder_transformer".into()))?;
         let upsample_state = match &self.upsample {
             Some(us) => Some(us.init_state(batch_size, device)?),
             None => None,
@@ -215,9 +309,9 @@ impl MimiModel {
         };
         let s = MimiState {
             _encoder_state: self.encoder.init_state(batch_size, device)?,
-            decoder_state: self.decoder.init_state(batch_size, device)?,
+            decoder_state: decoder.init_state(batch_size, device)?,
             _encoder_transformer_state: self.encoder_transformer.init_state(),
-            decoder_transformer_state: self.decoder_transformer.init_state(),
+            decoder_transformer_state: decoder_transformer.init_state(),
             _downsample_state,
             upsample_state,
         };
@@ -294,11 +388,17 @@ impl MimiModel {
     }
 
     /// Decode from latent to audio (streaming). Input: [B, C, T'].
+    ///
+    /// Requires a full model (loaded via `load()`, not `load_encoder_only()`).
     pub fn decode_from_latent(
         &self,
         latent: &Tensor,
         state: &mut MimiState,
     ) -> Result<Tensor> {
+        let decoder = self.decoder.as_ref()
+            .ok_or_else(|| candle_core::Error::Msg("decode requires decoder (use load(), not load_encoder_only())".into()))?;
+        let decoder_transformer = self.decoder_transformer.as_ref()
+            .ok_or_else(|| candle_core::Error::Msg("decode requires decoder_transformer".into()))?;
         // Upsample to encoder frame rate
         let emb = match (&self.upsample, &mut state.upsample_state) {
             (Some(us), Some(us_state)) => {
@@ -306,8 +406,8 @@ impl MimiModel {
             }
             _ => latent.clone(),
         };
-        let outs = self.decoder_transformer.forward(&emb, &mut state.decoder_transformer_state)?;
-        let audio = self.decoder.forward(&outs[0], &mut state.decoder_state)?;
+        let outs = decoder_transformer.forward(&emb, &mut state.decoder_transformer_state)?;
+        let audio = decoder.forward(&outs[0], &mut state.decoder_state)?;
         Ok(audio)
     }
 }
