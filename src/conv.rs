@@ -178,13 +178,30 @@ impl StreamingConv1d {
         let x_padded =
             if tp > 0 { Tensor::cat(&[&state.previous, x], 2)? } else { x.clone() };
 
+        let ek = self.effective_kernel_size();
+        let x_padded_len = x_padded.dim(2)?;
+
+        // Not enough data for even one conv output — accumulate in buffer and
+        // return a zero-length tensor.  This happens at the tail end of a
+        // streaming file when the final chunk is smaller than the kernel.
+        if x_padded_len < ek {
+            if tp > 0 {
+                // Keep entire x_padded as the new buffer (it's all we have)
+                state.previous = x_padded.contiguous()?;
+                if matches!(self.pad_mode, PadMode::Replicate) {
+                    state.first = false;
+                }
+            }
+            let b = x.dim(0)?;
+            return Tensor::zeros((b, self.conv.out_channels, 0), DType::F32, x.device());
+        }
+
         // Run convolution
         let y = self.conv.forward(&x_padded)?;
 
         // Update state
         if tp > 0 {
-            let xlen = x_padded.dim(2)?;
-            state.previous = x_padded.narrow(2, xlen - tp, tp)?.contiguous()?;
+            state.previous = x_padded.narrow(2, x_padded_len - tp, tp)?.contiguous()?;
             if matches!(self.pad_mode, PadMode::Replicate) {
                 state.first = false;
             }
