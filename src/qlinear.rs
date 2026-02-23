@@ -3,49 +3,62 @@ use candle_core::{Result, Tensor};
 use candle_nn::{Linear, Module};
 use std::sync::Arc;
 
-/// A linear layer that can hold either F32 weights (via QMatMul::Tensor)
-/// or quantized weights (via QMatMul::QTensor). Drop-in replacement for Linear.
+/// A linear layer that can hold either F32 weights (via `candle_nn::Linear`,
+/// using the optimized `gemm` matmul) or quantized weights (via `QMatMul`).
+///
+/// Important: the F32 path uses `Linear` directly, NOT `QMatMul::Tensor`,
+/// because `QMatMul::Tensor::forward` bypasses `gemm` and is much slower.
+enum Inner {
+    Linear(Linear),
+    Quantized { qmatmul: QMatMul, bias: Option<Tensor> },
+}
+
 pub struct QLinear {
-    inner: QMatMul,
-    bias: Option<Tensor>,
+    inner: Inner,
 }
 
 impl QLinear {
-    /// Wrap an existing F32 Linear as a QLinear (no quantization yet).
+    /// Wrap an existing F32 Linear — matmuls go through optimized `gemm`.
     pub fn from_linear(linear: Linear) -> Self {
-        let bias = linear.bias().cloned();
+        Self { inner: Inner::Linear(linear) }
+    }
+
+    /// Create from a QTensor (e.g. loaded from GGUF).
+    /// Matmuls go through candle's quantized kernel.
+    pub fn from_qtensor(qtensor: QTensor, bias: Option<Tensor>) -> Self {
         Self {
-            inner: QMatMul::Tensor(linear.weight().clone()),
-            bias,
+            inner: Inner::Quantized {
+                qmatmul: QMatMul::QTensor(Arc::new(qtensor)),
+                bias,
+            },
         }
     }
 
-    /// Create a QLinear directly from a QTensor (e.g. loaded from GGUF).
-    /// No runtime quantization needed — weights are already quantized.
-    pub fn from_qtensor(qtensor: QTensor, bias: Option<Tensor>) -> Self {
-        Self { inner: QMatMul::QTensor(Arc::new(qtensor)), bias }
-    }
-
-    /// Quantize the weight tensor in-place to the given GGML dtype (e.g. Q8_0).
+    /// Quantize F32 weights in-place to the given GGML dtype (e.g. Q8_0).
     /// No-op if already quantized.
     pub fn quantize_in_place(&mut self, dtype: GgmlDType) -> Result<()> {
-        match &self.inner {
-            QMatMul::Tensor(t) => {
-                let qtensor = QTensor::quantize(t, dtype)?;
-                self.inner = QMatMul::QTensor(Arc::new(qtensor));
-                Ok(())
-            }
-            _ => Ok(()),
+        if let Inner::Linear(linear) = &self.inner {
+            let qtensor = QTensor::quantize(linear.weight(), dtype)?;
+            self.inner = Inner::Quantized {
+                qmatmul: QMatMul::QTensor(Arc::new(qtensor)),
+                bias: linear.bias().cloned(),
+            };
         }
+        Ok(())
     }
 }
 
 impl Module for QLinear {
     fn forward(&self, x: &Tensor) -> Result<Tensor> {
-        let out = self.inner.forward(x)?;
-        match &self.bias {
-            Some(b) => out.broadcast_add(b),
-            None => Ok(out),
+        match &self.inner {
+            Inner::Linear(linear) => linear.forward(x),
+            Inner::Quantized { qmatmul, bias } => {
+                let out = qmatmul.forward(x)?;
+                match bias {
+                    Some(b) => out.broadcast_add(b),
+                    None => Ok(out),
+                }
+            }
         }
     }
 }
