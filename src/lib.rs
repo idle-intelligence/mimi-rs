@@ -5,6 +5,7 @@ pub mod dummy_quantizer;
 pub mod layer_scale;
 pub mod mimi;
 pub mod qlinear;
+pub mod quantizer;
 pub mod resample;
 pub mod rope;
 pub mod seanet;

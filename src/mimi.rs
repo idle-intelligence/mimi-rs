@@ -1,6 +1,7 @@
 use crate::config::MimiConfig;
 use crate::conv::{pad_for_conv1d, PadMode, StreamingConv1dState, StreamingConvTr1dState};
 use crate::dummy_quantizer::DummyQuantizer;
+use crate::quantizer::SplitResidualVectorQuantizer;
 use crate::resample::{ConvDownsample1d, ConvTrUpsample1d};
 use crate::seanet::{SEANetDecoder, SEANetDecoderState, SEANetEncoder, SEANetEncoderState};
 use crate::transformer::{ProjectedTransformer, StreamingTransformerState};
@@ -8,12 +9,18 @@ use candle_core::quantized::GgmlDType;
 use candle_core::{Device, Result, Tensor};
 use candle_nn::VarBuilder;
 
+/// Either a DummyQuantizer (TTS, output projection only) or a full SplitRVQ (encoder).
+pub enum QuantizerKind {
+    Dummy(DummyQuantizer),
+    SplitRvq(SplitResidualVectorQuantizer),
+}
+
 pub struct MimiModel {
     encoder: SEANetEncoder,
     decoder: SEANetDecoder,
     encoder_transformer: ProjectedTransformer,
     decoder_transformer: ProjectedTransformer,
-    pub quantizer: DummyQuantizer,
+    pub quantizer: QuantizerKind,
     downsample: Option<ConvDownsample1d>,
     upsample: Option<ConvTrUpsample1d>,
     frame_rate: usize,
@@ -22,6 +29,7 @@ pub struct MimiModel {
     _dimension: usize,
 }
 
+/// Decoder-only streaming state (used by TTS).
 #[derive(Debug, Clone)]
 pub struct MimiState {
     _encoder_state: SEANetEncoderState,
@@ -30,6 +38,14 @@ pub struct MimiState {
     decoder_transformer_state: StreamingTransformerState,
     _downsample_state: Option<StreamingConv1dState>,
     upsample_state: Option<StreamingConvTr1dState>,
+}
+
+/// Encoder-only streaming state (used by STT).
+#[derive(Debug, Clone)]
+pub struct MimiEncoderState {
+    pub encoder_state: SEANetEncoderState,
+    pub encoder_transformer_state: StreamingTransformerState,
+    pub downsample_state: Option<StreamingConv1dState>,
 }
 
 impl MimiModel {
@@ -93,11 +109,26 @@ impl MimiModel {
             cfg.transformer_dim_feedforward,
         )?;
 
-        let quantizer = DummyQuantizer::load(
-            vb.pp("quantizer"),
-            cfg.quantizer_dimension,
-            cfg.quantizer_output_dimension,
-        )?;
+        // Load quantizer based on config: SplitRVQ if num_codebooks > 0, else DummyQuantizer.
+        let quantizer = if cfg.num_codebooks > 0 {
+            let n_acoustic = cfg.num_codebooks - cfg.num_codebooks_semantic;
+            let split_rvq = SplitResidualVectorQuantizer::load(
+                vb.pp("quantizer"),
+                cfg.num_codebooks_semantic,
+                n_acoustic,
+                cfg.dimension,
+                cfg.codebook_dim,
+                cfg.codebook_bins,
+            )?;
+            QuantizerKind::SplitRvq(split_rvq)
+        } else {
+            let dummy = DummyQuantizer::load(
+                vb.pp("quantizer"),
+                cfg.quantizer_dimension,
+                cfg.quantizer_output_dimension,
+            )?;
+            QuantizerKind::Dummy(dummy)
+        };
 
         let hop_length: usize = cfg.ratios.iter().product();
         let encoder_frame_rate = cfg.sample_rate as f64 / hop_length as f64;
@@ -151,9 +182,26 @@ impl MimiModel {
         self.decoder_transformer.quantize_weights(dtype)
     }
 
-    /// Apply the quantizer output projection. Input: [B, quantizer_dim, T] -> [B, output_dim, T].
+    /// Apply the quantizer output projection (DummyQuantizer only).
+    /// Input: [B, quantizer_dim, T] -> [B, output_dim, T].
     pub fn quantizer_forward(&self, x: &Tensor) -> Result<Tensor> {
-        self.quantizer.forward(x)
+        match &self.quantizer {
+            QuantizerKind::Dummy(q) => q.forward(x),
+            QuantizerKind::SplitRvq(_) => {
+                candle_core::bail!("quantizer_forward not supported for SplitRVQ; use quantize_to_codes instead")
+            }
+        }
+    }
+
+    /// Encode latent to token IDs (SplitRVQ only).
+    /// Input: [B, dim, T'] latent → Output: [B, n_q, T'] u32 token indices.
+    pub fn quantize_to_codes(&self, latent: &Tensor) -> Result<Tensor> {
+        match &self.quantizer {
+            QuantizerKind::SplitRvq(q) => q.encode(latent),
+            QuantizerKind::Dummy(_) => {
+                candle_core::bail!("quantize_to_codes requires SplitRVQ quantizer (num_codebooks > 0)")
+            }
+        }
     }
 
     pub fn init_state(&self, batch_size: usize, device: &Device) -> Result<MimiState> {
@@ -176,6 +224,23 @@ impl MimiModel {
         Ok(s)
     }
 
+    /// Initialize encoder-only streaming state.
+    pub fn init_encoder_state(
+        &self,
+        batch_size: usize,
+        device: &Device,
+    ) -> Result<MimiEncoderState> {
+        let downsample_state = match &self.downsample {
+            Some(ds) => Some(ds.init_state(batch_size, device)?),
+            None => None,
+        };
+        Ok(MimiEncoderState {
+            encoder_state: self.encoder.init_state(batch_size, device)?,
+            encoder_transformer_state: self.encoder_transformer.init_state(),
+            downsample_state,
+        })
+    }
+
     /// Encode audio to latent (non-streaming). Returns [B, C, T'].
     pub fn encode_to_latent(&self, x: &Tensor) -> Result<Tensor> {
         let device = x.device().clone();
@@ -194,6 +259,37 @@ impl MimiModel {
         match &self.downsample {
             Some(ds) => ds.forward_no_state(emb),
             None => Ok(emb.clone()),
+        }
+    }
+
+    /// Streaming encode: [B, 1, T] audio → [B, C, T'] latent.
+    ///
+    /// Runs SEANetEncoder → encoder transformer → downsample, all streaming.
+    /// May return a tensor with T'=0 if not enough audio has accumulated.
+    pub fn encode_streaming(
+        &self,
+        audio: &Tensor,
+        state: &mut MimiEncoderState,
+    ) -> Result<Tensor> {
+        // SEANet encoder (streaming via conv buffers)
+        let emb = self.encoder.forward(audio, &mut state.encoder_state)?;
+
+        // Check if encoder produced any output frames
+        let t = emb.dim(2)?;
+        if t == 0 {
+            return Ok(emb);
+        }
+
+        // Encoder transformer (streaming via KV cache)
+        let outs = self
+            .encoder_transformer
+            .forward(&emb, &mut state.encoder_transformer_state)?;
+        let emb = &outs[0];
+
+        // Downsample to target frame rate (streaming via conv buffer)
+        match (&self.downsample, &mut state.downsample_state) {
+            (Some(ds), Some(ds_state)) => ds.forward(emb, ds_state),
+            _ => Ok(emb.clone()),
         }
     }
 
