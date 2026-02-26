@@ -1,6 +1,6 @@
 use crate::conv::{CausalConv1d, CausalConvTranspose1d, PadMode, StreamingConv1d, StreamingConvTranspose1d};
 use crate::qlinear::QLinear;
-use candle_core::quantized::{gguf_file, QTensor};
+use candle_core::quantized::{gguf_file, GgmlDType, QTensor};
 use candle_core::{Device, Result, Tensor};
 use candle_nn::{Conv1d, Conv1dConfig, ConvTranspose1d, ConvTranspose1dConfig};
 use std::io::Cursor;
@@ -41,21 +41,11 @@ impl<'a> GgufTensors<'a> {
         qt.dequantize(&self.device)
     }
 
-    /// Load a linear layer from GGUF.
+    /// Load a QLinear from GGUF.
     ///
     /// Looks for `{prefix}.weight` (required) and `{prefix}.bias` (optional).
-    /// All weights (including Q8_0) are dequantized to F32 and wrapped in
-    /// `candle_nn::Linear` so matmuls go through the optimized `gemm` crate.
-    ///
-    /// Rationale: candle's `QMatMul` for quantized tensors uses a naive
-    /// triple loop, while `Linear` uses `gemm` with SIMD-tiled, cache-blocked
-    /// kernels. On WASM with simd128, F32 gemm is ~1.7x faster than Q8_0
-    /// QMatMul for this model. We keep Q8_0 in the GGUF file for compact
-    /// download (178 MB vs 236 MB F32) and dequantize at load time.
-    ///
-    /// TODO: switch back to `QMatMul` once candle ships an optimized
-    /// quantized matmul kernel (tiled + SIMD) that can compete with gemm.
-    /// See: https://github.com/huggingface/candle/issues/XXXX
+    /// Q8_0 weights are kept as QTensor for quantized matmul; F32/F16/BF16
+    /// weights are dequantized and wrapped in `candle_nn::Linear` (gemm path).
     pub fn qlinear(&mut self, prefix: &str) -> Result<QLinear> {
         let weight_name = format!("{prefix}.weight");
         let bias_name = format!("{prefix}.bias");
@@ -70,8 +60,16 @@ impl<'a> GgufTensors<'a> {
             None
         };
 
-        let weight = self.tensor(&weight_name)?;
-        Ok(QLinear::from_linear(candle_nn::Linear::new(weight, bias)))
+        let qtensor = self.qt(&weight_name)?;
+        if qtensor.dtype() == GgmlDType::F32
+            || qtensor.dtype() == GgmlDType::F16
+            || qtensor.dtype() == GgmlDType::BF16
+        {
+            let weight = qtensor.dequantize(&self.device)?;
+            Ok(QLinear::from_linear(candle_nn::Linear::new(weight, bias)))
+        } else {
+            Ok(QLinear::from_qtensor(qtensor, bias))
+        }
     }
 
     /// Load a Conv1d from GGUF (always F32 — conv weights are not quantized).
