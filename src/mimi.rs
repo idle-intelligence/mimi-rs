@@ -506,6 +506,28 @@ impl MimiModel {
         }
     }
 
+    /// Decode codebook indices to audio (streaming).
+    ///
+    /// Input: `codes` [B, n_q, T'] u32 — only the first `n_active` codebooks
+    /// contribute, the rest are zero-padded. Used when the inference model
+    /// emits fewer than the full Mimi codebook count.
+    pub fn decode_from_codes_n(
+        &self,
+        codes: &Tensor,
+        n_active: usize,
+        state: &mut MimiState,
+    ) -> Result<Tensor> {
+        let latent = match &self.quantizer {
+            QuantizerKind::SplitRvq(q) => q.decode_n(codes, n_active)?,
+            QuantizerKind::Dummy(_) => {
+                candle_core::bail!(
+                    "decode_from_codes_n requires SplitRVQ quantizer (num_codebooks > 0)"
+                )
+            }
+        };
+        self.decode_from_latent(&latent, state)
+    }
+
     /// Decode from latent to audio (streaming). Input: [B, C, T'].
     ///
     /// Requires a full model (loaded via `load()`, not `load_encoder_only()`).

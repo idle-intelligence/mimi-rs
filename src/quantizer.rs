@@ -68,7 +68,6 @@ pub struct ResidualVectorQuantizer {
     /// Project model dim → codebook dim (Conv1d kernel_size=1)
     input_proj: Conv1d,
     /// Project codebook dim → model dim (Conv1d kernel_size=1)
-    #[allow(dead_code)]
     output_proj: Conv1d,
     /// Residual VQ codebooks
     quantizers: Vec<VectorQuantizer>,
@@ -134,6 +133,39 @@ impl ResidualVectorQuantizer {
         // Stack: [B, n_q, T]
         Tensor::cat(&all_codes, 1)
     }
+
+    /// Decode the first `n_active` codebooks back to projected vectors.
+    ///
+    /// Input:  `codes` [B, n_q, T] u32 — only the first `n_active` rows are used.
+    /// Output: [B, input_dim, T] f32 — sum of codebook embeddings then `output_proj`.
+    pub fn decode_n(&self, codes: &Tensor, n_active: usize) -> Result<Tensor> {
+        let (b, n_q_in, t) = codes.dims3()?;
+        let n_use = n_active.min(self.quantizers.len()).min(n_q_in);
+        if n_use == 0 {
+            // Match expected output shape with zeros: [B, input_dim, T].
+            let out_dim = self.output_proj.weight().dim(0)?;
+            return Tensor::zeros((b, out_dim, t), DType::F32, codes.device());
+        }
+
+        // Accumulate codebook embeddings in codebook_dim space.
+        let codebook_dim = self.quantizers[0].codebook.dim(1)?;
+        let mut accum: Option<Tensor> = None;
+        for q in 0..n_use {
+            let cb_codes = codes.narrow(1, q, 1)?;
+            let indices = cb_codes.flatten_all()?;
+            let quantized_flat = self.quantizers[q].codebook.index_select(&indices, 0)?;
+            let quantized = quantized_flat
+                .reshape((b, t, codebook_dim))?
+                .transpose(1, 2)?
+                .contiguous()?;
+            accum = Some(match accum {
+                Some(a) => a.add(&quantized)?,
+                None => quantized,
+            });
+        }
+        let accum = accum.unwrap();
+        self.output_proj.forward(&accum)
+    }
 }
 
 /// Split Residual Vector Quantizer.
@@ -181,6 +213,36 @@ impl SplitResidualVectorQuantizer {
         let first_codes = self.rvq_first.encode(x)?; // [B, n_first, T]
         let rest_codes = self.rvq_rest.encode(x)?; // [B, n_rest, T]
         Tensor::cat(&[&first_codes, &rest_codes], 1)
+    }
+
+    /// Number of semantic codebooks (rvq_first).
+    pub fn num_semantic(&self) -> usize {
+        self.rvq_first.quantizers.len()
+    }
+
+    /// Decode the first `n_active` codebooks back to model-dim vectors.
+    ///
+    /// Input:  `codes` [B, n_q, T] u32 — first `num_semantic()` rows are
+    ///         semantic, the rest acoustic. Only the first `n_active` rows
+    ///         contribute; remaining codebooks are zero-padded implicitly.
+    /// Output: [B, input_dim, T] f32.
+    pub fn decode_n(&self, codes: &Tensor, n_active: usize) -> Result<Tensor> {
+        let n_first = self.num_semantic();
+        let sem_active = n_first.min(n_active);
+        let sem = self.rvq_first.decode_n(codes, sem_active)?;
+
+        if n_active <= n_first {
+            return Ok(sem);
+        }
+        let rest_active = n_active - n_first;
+        let (b, n_q_in, t) = codes.dims3()?;
+        if n_q_in <= n_first || rest_active == 0 {
+            return Ok(sem);
+        }
+        let acoustic_codes = codes.narrow(1, n_first, n_q_in - n_first)?.contiguous()?;
+        let _ = (b, t);
+        let acoustic = self.rvq_rest.decode_n(&acoustic_codes, rest_active)?;
+        sem.add(&acoustic)
     }
 }
 
