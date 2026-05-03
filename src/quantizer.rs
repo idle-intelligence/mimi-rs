@@ -22,6 +22,23 @@ impl VectorQuantizer {
         Ok(Self { codebook, codebook_sq_norms })
     }
 
+    /// Decode indices back to codebook vectors.
+    ///
+    /// Input: indices [B, 1, T] (u32)
+    /// Returns: quantized [B, dim, T]
+    pub fn decode(&self, indices: &Tensor) -> Result<Tensor> {
+        let (b, _one, t) = indices.dims3()?;
+        let dim = self.codebook.dim(1)?;
+        // Flatten to [B*T]
+        let flat = indices.flatten_all()?;
+        let flat_u32 = flat.to_dtype(DType::U32)?;
+        let gathered = self.codebook.index_select(&flat_u32, 0)?; // [B*T, dim]
+        gathered
+            .reshape((b, t, dim))?
+            .transpose(1, 2)?
+            .contiguous()
+    }
+
     /// Quantize input vectors to nearest codebook entries.
     ///
     /// Input: [B, dim, T]
@@ -117,6 +134,32 @@ impl ResidualVectorQuantizer {
         embed_sum.broadcast_div(&usage)
     }
 
+    /// Decode: [B, n_q, T] token indices (u32) → [B, input_dim, T].
+    ///
+    /// Looks up each codebook, sums the quantized vectors, then projects back.
+    pub fn decode(&self, codes: &Tensor) -> Result<Tensor> {
+        self.decode_n(codes, self.quantizers.len())
+    }
+
+    /// Decode using only the first `n` codebooks (partial RVQ decode).
+    ///
+    /// Useful when the model generates fewer codebook tokens than the full RVQ.
+    /// Unused codebooks are simply not summed.
+    pub fn decode_n(&self, codes: &Tensor, n: usize) -> Result<Tensor> {
+        let n = n.min(self.quantizers.len());
+        let mut sum: Option<Tensor> = None;
+        for (i, vq) in self.quantizers.iter().take(n).enumerate() {
+            let code_i = codes.narrow(1, i, 1)?; // [B, 1, T]
+            let quantized = vq.decode(&code_i)?; // [B, codebook_dim, T]
+            sum = Some(match sum {
+                Some(s) => s.add(&quantized)?,
+                None => quantized,
+            });
+        }
+        let reconstructed = sum.unwrap();
+        self.output_proj.forward(&reconstructed)
+    }
+
     /// Encode: [B, input_dim, T] → [B, n_q, T] token indices (u32).
     pub fn encode(&self, x: &Tensor) -> Result<Tensor> {
         // Project input_dim → codebook_dim
@@ -181,6 +224,37 @@ impl SplitResidualVectorQuantizer {
         let first_codes = self.rvq_first.encode(x)?; // [B, n_first, T]
         let rest_codes = self.rvq_rest.encode(x)?; // [B, n_rest, T]
         Tensor::cat(&[&first_codes, &rest_codes], 1)
+    }
+
+    /// Decode: [B, n_q, T] token indices (u32) → [B, dim, T].
+    ///
+    /// Splits codes into semantic and acoustic, decodes each sub-RVQ, sums results.
+    pub fn decode(&self, codes: &Tensor) -> Result<Tensor> {
+        let n_first = self.rvq_first.quantizers.len();
+        let first_codes = codes.narrow(1, 0, n_first)?;
+        let rest_codes = codes.narrow(1, n_first, self.rvq_rest.quantizers.len())?;
+        let first_latent = self.rvq_first.decode(&first_codes)?;
+        let rest_latent = self.rvq_rest.decode(&rest_codes)?;
+        first_latent.add(&rest_latent)
+    }
+
+    /// Decode using only the first `n_total` codebooks (partial decode).
+    ///
+    /// When the model only generates tokens for a subset of codebooks,
+    /// this avoids adding garbage from unused codebook entries.
+    pub fn decode_n(&self, codes: &Tensor, n_total: usize) -> Result<Tensor> {
+        let n_first = self.rvq_first.quantizers.len();
+        let first_codes = codes.narrow(1, 0, n_first.min(n_total))?;
+        let first_latent = self.rvq_first.decode_n(&first_codes, n_total.min(n_first))?;
+
+        if n_total <= n_first {
+            return Ok(first_latent);
+        }
+
+        let n_rest = n_total - n_first;
+        let rest_codes = codes.narrow(1, n_first, n_rest)?;
+        let rest_latent = self.rvq_rest.decode_n(&rest_codes, n_rest)?;
+        first_latent.add(&rest_latent)
     }
 }
 
@@ -462,6 +536,156 @@ mod tests {
 
         assert_eq!(codes.dims(), &[b, n_q_semantic + n_q_acoustic, t]);
         assert_eq!(codes.dtype(), DType::U32);
+
+        Ok(())
+    }
+
+    // ---- Decode round-trip tests ----
+
+    /// VectorQuantizer::decode produces [B, dim, T] from [B, 1, T] u32 indices.
+    #[test]
+    fn vq_decode_output_shape() -> Result<()> {
+        let n_bins = 8usize;
+        let dim = 5usize;
+        let codebook = Tensor::randn(0f32, 1.0, (n_bins, dim), &DEV)?;
+        let vq = VectorQuantizer::new(codebook)?;
+
+        let b = 2usize;
+        let t = 7usize;
+        // Random valid indices in [0, n_bins)
+        let raw: Vec<u32> = (0..(b * t) as u32).map(|i| i % n_bins as u32).collect();
+        let indices = Tensor::from_vec(raw, (b, 1, t), &DEV)?;
+
+        let decoded = vq.decode(&indices)?;
+        assert_eq!(decoded.dims(), &[b, dim, t]);
+
+        Ok(())
+    }
+
+    /// ResidualVectorQuantizer::decode produces [B, input_dim, T] from [B, n_q, T] u32 codes.
+    #[test]
+    fn rvq_decode_output_shape() -> Result<()> {
+        let n_codebooks = 3usize;
+        let input_dim = 4usize;
+        let codebook_dim = 4usize;
+        let codebook_bins = 8usize;
+
+        let tensors = make_rvq_tensors("", n_codebooks, input_dim, codebook_dim, codebook_bins)?;
+        let vb = VarBuilder::from_tensors(tensors, DType::F32, &DEV);
+        let rvq = ResidualVectorQuantizer::load(vb, n_codebooks, input_dim, codebook_dim, codebook_bins)?;
+
+        let b = 2usize;
+        let t = 10usize;
+        let raw: Vec<u32> = (0..(b * n_codebooks * t) as u32)
+            .map(|i| i % codebook_bins as u32)
+            .collect();
+        let codes = Tensor::from_vec(raw, (b, n_codebooks, t), &DEV)?;
+
+        let decoded = rvq.decode(&codes)?;
+        assert_eq!(decoded.dims(), &[b, input_dim, t]);
+
+        Ok(())
+    }
+
+    /// ResidualVectorQuantizer::decode_n with n < n_codebooks still produces [B, input_dim, T].
+    #[test]
+    fn rvq_decode_n_partial() -> Result<()> {
+        let n_codebooks = 4usize;
+        let input_dim = 4usize;
+        let codebook_dim = 4usize;
+        let codebook_bins = 8usize;
+
+        let tensors = make_rvq_tensors("", n_codebooks, input_dim, codebook_dim, codebook_bins)?;
+        let vb = VarBuilder::from_tensors(tensors, DType::F32, &DEV);
+        let rvq = ResidualVectorQuantizer::load(vb, n_codebooks, input_dim, codebook_dim, codebook_bins)?;
+
+        let b = 1usize;
+        let t = 5usize;
+        // Only supply 2 codebooks worth of codes
+        let n_partial = 2usize;
+        let raw: Vec<u32> = (0..(b * n_partial * t) as u32)
+            .map(|i| i % codebook_bins as u32)
+            .collect();
+        let codes = Tensor::from_vec(raw, (b, n_partial, t), &DEV)?;
+
+        let decoded = rvq.decode_n(&codes, n_partial)?;
+        assert_eq!(decoded.dims(), &[b, input_dim, t]);
+
+        Ok(())
+    }
+
+    /// SplitResidualVectorQuantizer::decode produces [B, input_dim, T].
+    #[test]
+    fn split_rvq_decode_output_shape() -> Result<()> {
+        let n_q_semantic = 1usize;
+        let n_q_acoustic = 3usize;
+        let n_q = n_q_semantic + n_q_acoustic;
+        let input_dim = 4usize;
+        let codebook_dim = 4usize;
+        let codebook_bins = 8usize;
+
+        let mut tensors = HashMap::new();
+        tensors.extend(make_rvq_tensors(
+            "semantic_residual_vector_quantizer.",
+            n_q_semantic, input_dim, codebook_dim, codebook_bins,
+        )?);
+        tensors.extend(make_rvq_tensors(
+            "acoustic_residual_vector_quantizer.",
+            n_q_acoustic, input_dim, codebook_dim, codebook_bins,
+        )?);
+
+        let vb = VarBuilder::from_tensors(tensors, DType::F32, &DEV);
+        let split = SplitResidualVectorQuantizer::load(
+            vb, n_q_semantic, n_q_acoustic, input_dim, codebook_dim, codebook_bins,
+        )?;
+
+        let b = 1usize;
+        let t = 10usize;
+        let raw: Vec<u32> = (0..(b * n_q * t) as u32)
+            .map(|i| i % codebook_bins as u32)
+            .collect();
+        let codes = Tensor::from_vec(raw, (b, n_q, t), &DEV)?;
+
+        let decoded = split.decode(&codes)?;
+        assert_eq!(decoded.dims(), &[b, input_dim, t]);
+
+        Ok(())
+    }
+
+    /// SplitResidualVectorQuantizer::decode_n with n_total <= n_q_semantic (only first sub-RVQ).
+    #[test]
+    fn split_rvq_decode_n_semantic_only() -> Result<()> {
+        let n_q_semantic = 1usize;
+        let n_q_acoustic = 3usize;
+        let input_dim = 4usize;
+        let codebook_dim = 4usize;
+        let codebook_bins = 8usize;
+
+        let mut tensors = HashMap::new();
+        tensors.extend(make_rvq_tensors(
+            "semantic_residual_vector_quantizer.",
+            n_q_semantic, input_dim, codebook_dim, codebook_bins,
+        )?);
+        tensors.extend(make_rvq_tensors(
+            "acoustic_residual_vector_quantizer.",
+            n_q_acoustic, input_dim, codebook_dim, codebook_bins,
+        )?);
+
+        let vb = VarBuilder::from_tensors(tensors, DType::F32, &DEV);
+        let split = SplitResidualVectorQuantizer::load(
+            vb, n_q_semantic, n_q_acoustic, input_dim, codebook_dim, codebook_bins,
+        )?;
+
+        let b = 1usize;
+        let t = 8usize;
+        // Only 1 codebook (semantic only)
+        let raw: Vec<u32> = (0..(b * n_q_semantic * t) as u32)
+            .map(|i| i % codebook_bins as u32)
+            .collect();
+        let codes = Tensor::from_vec(raw, (b, n_q_semantic, t), &DEV)?;
+
+        let decoded = split.decode_n(&codes, n_q_semantic)?;
+        assert_eq!(decoded.dims(), &[b, input_dim, t]);
 
         Ok(())
     }

@@ -454,6 +454,51 @@ impl MimiModel {
         }
     }
 
+    /// Decode token IDs to latent (SplitRVQ only).
+    /// Input: [B, n_q, T'] u32 token indices → Output: [B, dim, T'].
+    pub fn dequantize_codes(&self, codes: &Tensor) -> Result<Tensor> {
+        match &self.quantizer {
+            QuantizerKind::SplitRvq(q) => q.decode(codes),
+            QuantizerKind::Dummy(_) => {
+                candle_core::bail!("dequantize_codes requires SplitRVQ quantizer (num_codebooks > 0)")
+            }
+        }
+    }
+
+    /// Decode token IDs to latent using only the first `n` codebooks.
+    /// Avoids adding garbage from unused codebook entries when the model
+    /// generates fewer tokens than the full RVQ.
+    pub fn dequantize_codes_n(&self, codes: &Tensor, n: usize) -> Result<Tensor> {
+        match &self.quantizer {
+            QuantizerKind::SplitRvq(q) => q.decode_n(codes, n),
+            QuantizerKind::Dummy(_) => {
+                candle_core::bail!("dequantize_codes_n requires SplitRVQ quantizer")
+            }
+        }
+    }
+
+    /// Decode token IDs to audio (streaming).
+    /// Input: [B, n_q, T'] u32 token indices → Output: [B, 1, T] audio.
+    pub fn decode_from_codes(
+        &self,
+        codes: &Tensor,
+        state: &mut MimiState,
+    ) -> Result<Tensor> {
+        let latent = self.dequantize_codes(codes)?;
+        self.decode_from_latent(&latent, state)
+    }
+
+    /// Decode token IDs to audio using only the first `n` codebooks (streaming).
+    pub fn decode_from_codes_n(
+        &self,
+        codes: &Tensor,
+        n_codebooks: usize,
+        state: &mut MimiState,
+    ) -> Result<Tensor> {
+        let latent = self.dequantize_codes_n(codes, n_codebooks)?;
+        self.decode_from_latent(&latent, state)
+    }
+
     pub fn init_state(&self, batch_size: usize, device: &Device) -> Result<MimiState> {
         let decoder = self.decoder.as_ref()
             .ok_or_else(|| candle_core::Error::Msg("init_state requires decoder (use load(), not load_encoder_only())".into()))?;
