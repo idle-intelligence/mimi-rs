@@ -141,7 +141,7 @@ fn causal_mask(num_queries: usize, num_keys: usize, device: &Device) -> Result<O
     if num_queries == 1 {
         return Ok(None);
     }
-    let shift = num_keys - num_queries;
+    let shift = num_keys.saturating_sub(num_queries);
     let mut data = Vec::with_capacity(num_queries * num_keys);
     for q in 0..num_queries {
         for k in 0..num_keys {
