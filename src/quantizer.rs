@@ -652,6 +652,40 @@ mod tests {
         Ok(())
     }
 
+    /// VectorQuantizer: decode(encode(x).indices) must reproduce the same codebook vectors
+    /// that encode() selected. The residual ||decode - quantized|| must be < 1e-5.
+    #[test]
+    fn test_vq_roundtrip_quality() -> Result<()> {
+        let num_entries = 16usize;
+        let dim = 32usize;
+        let t = 8usize;
+
+        // Build a small codebook with well-separated entries
+        let codebook = Tensor::randn(0f32, 1.0, (num_entries, dim), &DEV)?;
+        let vq = VectorQuantizer::new(codebook)?;
+
+        // Random input [B=1, dim=32, T=8]
+        let input = Tensor::randn(0f32, 1.0, (1, dim, t), &DEV)?;
+
+        // Encode: get quantized vectors and indices
+        let (quantized, indices) = vq.encode(&input)?;
+        assert_eq!(indices.dims(), &[1, 1, t]);
+        assert_eq!(quantized.dims(), &[1, dim, t]);
+
+        // Decode: look up the same indices
+        let reconstructed = vq.decode(&indices)?;
+        assert_eq!(reconstructed.dims(), &[1, dim, t]);
+
+        // ||reconstructed - quantized|| must be ~0
+        let diff_norm: f32 = reconstructed.sub(&quantized)?.sqr()?.sum_all()?.to_scalar()?;
+        assert!(
+            diff_norm < 1e-5,
+            "decode(encode(x).indices) should reproduce quantized vectors, ||diff||²={diff_norm}"
+        );
+
+        Ok(())
+    }
+
     /// SplitResidualVectorQuantizer::decode_n with n_total <= n_q_semantic (only first sub-RVQ).
     #[test]
     fn split_rvq_decode_n_semantic_only() -> Result<()> {
