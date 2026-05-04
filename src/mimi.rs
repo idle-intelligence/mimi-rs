@@ -16,6 +16,17 @@ pub enum QuantizerKind {
     SplitRvq(SplitResidualVectorQuantizer),
 }
 
+impl candle_nn::Module for QuantizerKind {
+    fn forward(&self, xs: &Tensor) -> Result<Tensor> {
+        match self {
+            QuantizerKind::Dummy(q) => q.forward(xs),
+            QuantizerKind::SplitRvq(_) => {
+                candle_core::bail!("Module::forward not supported for SplitRVQ; use quantize_to_codes")
+            }
+        }
+    }
+}
+
 pub struct MimiModel {
     encoder: Option<SEANetEncoder>,
     decoder: Option<SEANetDecoder>,
