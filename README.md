@@ -20,4 +20,6 @@ mimi-rs = { git = "https://github.com/idle-intelligence/mimi-rs.git" }
 
 ## License
 
-Model weights: [Kyutai license](https://huggingface.co/kyutai/mimi). Code: MIT.
+Licensed under either of [Apache License, Version 2.0](LICENSE-APACHE) or [MIT license](LICENSE-MIT) at your option.
+
+This is an original Rust reimplementation of Kyutai's Mimi architecture, developed against [kyutai-labs/moshi](https://github.com/kyutai-labs/moshi). The Mimi model weights on [huggingface.co/kyutai/mimi](https://huggingface.co/kyutai/mimi) are separately licensed under CC-BY-4.0 and are not distributed in this repository.
