@@ -88,7 +88,9 @@ pub fn dequantize_and_remap(buffer: &[u8]) -> Vec<u8> {
 
             let scale_bytes = scale_tensor.data();
             let scales: Vec<half::bf16> = scale_bytes
-                .chunks_exact(2)
+                .as_chunks::<2>()
+                .0
+                .iter()
                 .map(|c| half::bf16::from_le_bytes([c[0], c[1]]))
                 .collect();
 
@@ -96,8 +98,7 @@ pub fn dequantize_and_remap(buffer: &[u8]) -> Vec<u8> {
             let total = out_channels * elements_per_channel;
             let mut bf16_bytes: Vec<u8> = Vec::with_capacity(total * 2);
 
-            for ch in 0..out_channels {
-                let s = scales[ch];
+            for (ch, &s) in scales.iter().enumerate().take(out_channels) {
                 let base = ch * elements_per_channel;
                 for i in 0..elements_per_channel {
                     let q = i8_data[base + i] as i8;

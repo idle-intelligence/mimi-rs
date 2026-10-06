@@ -11,6 +11,10 @@ use candle_core::{Device, Result, Tensor};
 use candle_nn::VarBuilder;
 
 /// Either a DummyQuantizer (TTS, output projection only) or a full SplitRVQ (encoder).
+///
+/// Not boxed: `SplitRvq` keeps this crate's public API (downstream code
+/// matches on `QuantizerKind::SplitRvq(SplitResidualVectorQuantizer)` directly).
+#[allow(clippy::large_enum_variant)]
 pub enum QuantizerKind {
     Dummy(DummyQuantizer),
     SplitRvq(SplitResidualVectorQuantizer),

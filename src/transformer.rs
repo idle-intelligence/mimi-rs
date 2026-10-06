@@ -547,7 +547,7 @@ impl StreamingTransformer {
         let mut layers = Vec::with_capacity(num_layers);
         for i in 0..num_layers {
             layers.push(StreamingTransformerLayer::load(
-                vb.pp(&format!("layers.{i}")),
+                vb.pp(format!("layers.{i}")),
                 d_model,
                 num_heads,
                 dim_feedforward,
@@ -665,7 +665,7 @@ impl ProjectedTransformer {
                 output_projs.push(None);
             } else {
                 let proj =
-                    QLinear::from_linear(candle_nn::linear(d_model, out_dim, vb.pp(&format!("output_proj.{i}")))?);
+                    QLinear::from_linear(candle_nn::linear(d_model, out_dim, vb.pp(format!("output_proj.{i}")))?);
                 output_projs.push(Some(proj));
             }
         }
@@ -724,10 +724,8 @@ impl ProjectedTransformer {
         if let Some(proj) = &mut self.input_proj {
             proj.quantize_in_place(dtype)?;
         }
-        for proj in &mut self.output_projs {
-            if let Some(p) = proj {
-                p.quantize_in_place(dtype)?;
-            }
+        for p in self.output_projs.iter_mut().flatten() {
+            p.quantize_in_place(dtype)?;
         }
         Ok(())
     }

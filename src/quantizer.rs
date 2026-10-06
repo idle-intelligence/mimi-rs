@@ -114,7 +114,7 @@ impl ResidualVectorQuantizer {
         let mut quantizers = Vec::with_capacity(n_codebooks);
         for i in 0..n_codebooks {
             let codebook =
-                Self::load_codebook(&vb.pp(&format!("layers.{i}.codebook")), codebook_bins, codebook_dim)?;
+                Self::load_codebook(&vb.pp(format!("layers.{i}.codebook")), codebook_bins, codebook_dim)?;
             quantizers.push(VectorQuantizer::new(codebook)?);
         }
 

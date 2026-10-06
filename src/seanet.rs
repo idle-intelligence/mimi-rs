@@ -33,7 +33,7 @@ impl SEANetResnetBlock {
             let out_c = if i == kernel_sizes.len() - 1 { dim } else { hidden };
             // block.{2*i+1} in Python (ELU at even indices, Conv at odd)
             let conv = StreamingConv1d::load(
-                vb.pp(&format!("block.{}", 2 * i + 1)),
+                vb.pp(format!("block.{}", 2 * i + 1)),
                 in_c,
                 out_c,
                 ks,
@@ -166,7 +166,7 @@ impl SEANetEncoder {
             for j in 0..n_residual_layers {
                 let dilation = dilation_base.pow(j as u32);
                 let block = SEANetResnetBlock::load(
-                    vb.pp(&format!("model.{layer_idx}")),
+                    vb.pp(format!("model.{layer_idx}")),
                     mult * n_filters,
                     &[residual_kernel_size, 1],
                     &[dilation, 1],
@@ -179,7 +179,7 @@ impl SEANetEncoder {
 
             // ELU at layer_idx, downsample conv at layer_idx+1
             let downsample = StreamingConv1d::load(
-                vb.pp(&format!("model.{}", layer_idx + 1)),
+                vb.pp(format!("model.{}", layer_idx + 1)),
                 mult * n_filters,
                 mult * n_filters * 2,
                 ratio * 2,
@@ -196,7 +196,7 @@ impl SEANetEncoder {
 
         // ELU at layer_idx, final conv at layer_idx+1
         let final_conv = StreamingConv1d::load(
-            vb.pp(&format!("model.{}", layer_idx + 1)),
+            vb.pp(format!("model.{}", layer_idx + 1)),
             mult * n_filters,
             dimension,
             last_kernel_size,
@@ -386,7 +386,7 @@ impl SEANetDecoder {
         for &ratio in ratios {
             // ELU at layer_idx, upsample at layer_idx+1
             let upsample = StreamingConvTranspose1d::load(
-                vb.pp(&format!("model.{}", layer_idx + 1)),
+                vb.pp(format!("model.{}", layer_idx + 1)),
                 mult * n_filters,
                 mult * n_filters / 2,
                 ratio * 2,
@@ -400,7 +400,7 @@ impl SEANetDecoder {
             for j in 0..n_residual_layers {
                 let dilation = dilation_base.pow(j as u32);
                 let block = SEANetResnetBlock::load(
-                    vb.pp(&format!("model.{layer_idx}")),
+                    vb.pp(format!("model.{layer_idx}")),
                     mult * n_filters / 2,
                     &[residual_kernel_size, 1],
                     &[dilation, 1],
@@ -417,7 +417,7 @@ impl SEANetDecoder {
 
         // ELU at layer_idx, final conv at layer_idx+1
         let final_conv = StreamingConv1d::load(
-            vb.pp(&format!("model.{}", layer_idx + 1)),
+            vb.pp(format!("model.{}", layer_idx + 1)),
             n_filters,
             channels,
             last_kernel_size,
