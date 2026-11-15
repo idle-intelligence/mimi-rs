@@ -2,7 +2,7 @@
 
 Rust implementation of the [Mimi](https://huggingface.co/kyutai/mimi) audio codec by Kyutai Labs, built on [candle](https://github.com/huggingface/candle).
 
-Shared library used by [tts-web](https://github.com/idle-intelligence/tts-web) and stt-web for streaming audio encoding/decoding in the browser via WASM.
+Shared library used by [tts-web](https://github.com/idle-intelligence/tts-web), [stt-web](https://github.com/idle-intelligence/stt-web) and [sts-web](https://github.com/idle-intelligence/sts-web) for streaming audio encoding/decoding in the browser via WASM.
 
 ## Components
 
